@@ -10,8 +10,8 @@ import logging
 import random
 import time
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from datetime import datetime, timedelta
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -47,8 +47,8 @@ VPLINK_API_URL       = "https://vplink.in/api"   # VPLink API endpoint
 # ─────────────────────────── DATABASE ───────────────────────────────────────
 
 def get_db():
-    """Return a new psycopg2 connection."""
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    """Return a new psycopg v3 connection."""
+    return psycopg.connect(DATABASE_URL)
 
 
 def init_db():
@@ -104,11 +104,11 @@ def init_db():
 def db_get_user(user_id: int) -> dict | None:
     try:
         conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
         conn.close()
-        return dict(row) if row else None
+        return row if row else None
     except Exception as e:
         logger.error(f"db_get_user error: {e}")
         return None
@@ -735,7 +735,7 @@ async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
                 SELECT user_id FROM users
                 WHERE access_until IS NOT NULL
