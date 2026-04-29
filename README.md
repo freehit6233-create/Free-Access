@@ -1,142 +1,175 @@
-# 🎬 VVIP VDO TELE BOT
+# XVIP Telegram Video Manager Bot
 
-Advanced Telegram Video Bot with 6-hour free access system, admin panel, vplink verification, and auto-delete.
-
----
-
-## 📁 Files
-
-| File | Purpose |
-|------|---------|
-| `bot.py` | Main bot logic |
-| `requirements.txt` | Python dependencies |
-| `README.md` | This file |
+Advanced Telegram bot with VPLink verification, Neon PostgreSQL, daily free limits, and auto-delete.
 
 ---
 
-## ⚙️ Environment Variables
+## Features
 
-Set these in Railway → Project → Variables:
-
-| Variable | Description |
-|----------|-------------|
-| `BOT_TOKEN` | From [@BotFather](https://t.me/BotFather) |
-| `ADMIN_ID` | Your Telegram numeric user ID |
-| `DATABASE_URL` | Neon Console PostgreSQL connection string |
-| `VPLINK_API_KEY` | API key from vplink.in dashboard |
-| `CHANNEL_ID` | Private channel ID (e.g. `-100xxxxxxxxxx`) |
+| Feature | Details |
+|---|---|
+| Auto video fetch | Watches SOURCE_CHANNEL, saves file_id to DB |
+| protect_content | All videos — no download, no forward |
+| Auto-delete | Videos deleted 10 minutes after sending |
+| Daily free limit | 3 videos/day per user |
+| VPLink integration | Generates verified short links for access |
+| 3-hour access | After verification, unlimited videos for 3 hours |
+| 2% repeat | Random repeat of older videos |
+| Pagination | Previous / Next buttons, edits message in place |
+| Admin commands | /status, /broadcast, /settimer |
+| Expiry notification | User notified when 3-hour access expires |
 
 ---
 
-## 🚀 Railway Deployment
-
-1. Push all files to a GitHub repo.
-2. Open [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**.
-3. Add all 5 environment variables above.
-4. Railway auto-detects Python. If not, add a `Procfile`:
+## File Structure
 
 ```
-worker: python bot.py
-```
-
-5. Deploy. Check logs for `Bot starting...` and `DB initialised ✓`.
-
----
-
-## 🗄️ Neon PostgreSQL Setup
-
-1. Go to [neon.tech](https://neon.tech) → Create project.
-2. Copy the **Connection String** (starts with `postgresql://...`).
-3. Paste it as `DATABASE_URL` in Railway variables.
-4. Tables are created **automatically** on first bot start — no manual SQL needed.
-
----
-
-## 🔗 Adding Videos
-
-Videos are fetched from your **private Telegram channel** (`CHANNEL_ID`).
-
-**Steps:**
-1. Post a video to your private channel.
-2. Note the message ID (forward to [@userinfobot](https://t.me/userinfobot) or check URL).
-3. In your bot chat (as admin), send:
-   ```
-   /addvideo <message_id>
-   ```
-   Example: `/addvideo 42`
-
-Repeat for each video. They'll be delivered in order (by ID).
-
-> ⚠️ Bot must be added as **admin** to the private channel.
-
----
-
-## 🤖 Admin Commands
-
-| Command | Description |
-|---------|-------------|
-| `/panel` | Open admin control panel |
-| `/status` | Bot statistics |
-| `/addvideo <msg_id>` | Add a video from private channel |
-| `/ban <user_id>` | Ban a user |
-| `/unban <user_id>` | Unban a user |
-
-**Admin Panel buttons:**
-- 📊 **Status** — Users, verifications, videos count
-- 📢 **Broadcast** — Send message to all users
-- ⏱ **Set Timer** — Change auto-delete time (default: 10 min)
-- ⚙️ **Settings** — Change bot settings via `key=value`
-
----
-
-## 🔑 Available Settings (via /panel → Settings)
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `delete_after_minutes` | `10` | Auto-delete timer for videos |
-| `vplink_url` | `https://vplink.in` | vplink base URL |
-| `access_hours` | `6` | Free access duration (logic uses this) |
-
----
-
-## 🔄 User Flow
-
-```
-/start
-  └─► Welcome + "Get Link" button
-        └─► vplink.in short URL generated
-              └─► User completes verification
-                    └─► Deep-link returns to bot (/start verify_TOKEN)
-                          └─► 6-hour access granted
-                                └─► First video sent automatically
-                                      └─► Previous / Next navigation
-                                            └─► Video auto-deletes after N minutes
+.
+├── bot.py            ← Main bot (all logic)
+├── requirements.txt  ← Python dependencies
+└── README.md         ← This file
 ```
 
 ---
 
-## 🛠 Local Development
+## Environment Variables
+
+Set these in Railway (or .env locally):
+
+| Variable | Description | Example |
+|---|---|---|
+| `BOT_TOKEN` | Your BotFather token | `123456:ABC-DEF...` |
+| `ADMIN_ID` | Your Telegram numeric user ID | `987654321` |
+| `SOURCE_CHANNEL_ID` | Private channel ID (negative number) | `-1001234567890` |
+| `DATABASE_URL` | Neon PostgreSQL connection string | `postgresql://user:pass@host/db` |
+| `VPLINK_API_KEY` | Your VPLink API key | `abc123xyz` |
+
+---
+
+## Local Setup
 
 ```bash
+# 1. Clone the repo
+git clone https://github.com/your-username/your-bot-repo.git
+cd your-bot-repo
+
+# 2. Create virtual environment
+python3 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
 
-export BOT_TOKEN=...
-export ADMIN_ID=...
-export DATABASE_URL=...
-export VPLINK_API_KEY=...
-export CHANNEL_ID=...
+# 4. Set environment variables
+export BOT_TOKEN="your_token"
+export ADMIN_ID="your_id"
+export SOURCE_CHANNEL_ID="-1001234567890"
+export DATABASE_URL="postgresql://..."
+export VPLINK_API_KEY="your_vplink_key"
 
+# 5. Run
 python bot.py
 ```
 
 ---
 
-## ❓ Troubleshooting
+## Railway Deployment
 
-| Problem | Fix |
-|---------|-----|
-| `copy_message` fails | Make sure bot is admin in private channel |
-| Videos not showing | Check `CHANNEL_ID` format (must be `-100xxxxxxx`) |
-| DB errors | Check `DATABASE_URL` has `sslmode=require` |
-| vplink returns original URL | Check `VPLINK_API_KEY` is correct |
-| Bot not starting on Railway | Add `Procfile` with `worker: python bot.py` |
+### Step 1 — Push code to GitHub
+```bash
+git init
+git add .
+git commit -m "Initial commit"
+git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
+git push -u origin main
+```
+
+### Step 2 — Create Railway project
+1. Go to [railway.app](https://railway.app) → New Project
+2. Select **Deploy from GitHub repo**
+3. Choose your repository
+
+### Step 3 — Add environment variables
+In Railway dashboard → your service → **Variables** tab, add all 5 variables from the table above.
+
+### Step 4 — Set start command
+In **Settings** → **Deploy** → **Start Command**:
+```
+python bot.py
+```
+
+### Step 5 — Deploy
+Railway will auto-deploy on every `git push` to `main`.
+
+---
+
+## Neon PostgreSQL Setup
+
+1. Go to [neon.tech](https://neon.tech) → Create project
+2. Copy the **Connection string** (it looks like `postgresql://user:pass@host.neon.tech/neondb?sslmode=require`)
+3. Set it as `DATABASE_URL` in Railway
+
+The bot creates all tables automatically on first run:
+- `videos` — stores file_id of each video
+- `users` — tracks daily count, access expiry, current index
+- `verifications` — one-time tokens for VPLink verification
+- `settings` — configurable values (access_hours)
+
+---
+
+## How the Verification Flow Works
+
+```
+User clicks "Next" after 3 free videos
+        ↓
+Bot calls VPLink API → generates short URL wrapping
+    t.me/YourBot?start=verify_USERID_TOKEN
+        ↓
+User opens short URL → VPLink interstitial page
+        ↓
+User clicks "Continue" on VPLink page
+        ↓
+Telegram opens: t.me/YourBot?start=verify_USERID_TOKEN
+        ↓
+Bot validates token (30-min window, single use)
+        ↓
+✅ Access granted for 3 hours (configurable)
+```
+
+---
+
+## Admin Commands
+
+| Command | Who | Description |
+|---|---|---|
+| `/start` | Everyone | Start bot, shows first video |
+| `/status` | Admin only | Verifications (24h), total videos, timer |
+| `/broadcast` | Admin only | Reply to any message → sends to all users |
+| `/settimer 6` | Admin only | Change access duration to 6 hours |
+
+### Broadcast usage
+1. Send or forward the image/text you want to broadcast
+2. Reply to it with `/broadcast`
+3. Bot sends it to all registered users
+
+---
+
+## Configuration (in bot.py)
+
+```python
+FREE_VIDEOS_PER_DAY  = 3      # daily free limit
+DEFAULT_ACCESS_HOURS = 3      # hours of verified access
+VIDEO_DELETE_MINUTES = 10     # auto-delete timer
+REPEAT_CHANCE        = 0.02   # 2% random repeat chance
+```
+
+---
+
+## Source Channel Setup
+
+1. Create a **private Telegram channel**
+2. Add your bot as an **Administrator** with "Post Messages" permission
+3. Get the channel ID (use [@userinfobot](https://t.me/userinfobot) or forward a message to a bot that shows IDs)
+4. Set it as `SOURCE_CHANNEL_ID` (will be a negative number like `-1001234567890`)
+
+Any video posted to this channel will be automatically saved to the database.
