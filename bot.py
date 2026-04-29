@@ -1,12 +1,11 @@
 """
 XVIP Telegram Video Manager Bot
 ================================
-v2 Fixes:
-- Connection pooling (ConnectionPool) → much faster DB calls
-- All-videos-seen → auto random mode
-- Verify success: welcome msg auto-deletes, video appears instantly
-- Video counter shows "Video X of Total"
-- Clean UI on verify callback
+v3 Improvements:
+- Resume from last position: /start wapas aane par same index se shuru
+- Speed boost: bot_me cached, async VPLink, batched DB reads in nav_callback
+- UI polish: welcome msg shows current position, cleaner access gate
+- All v2 features retained
 """
 
 import os
@@ -56,6 +55,7 @@ VPLINK_API_URL       = "https://vplink.in/api"
 # Pool opens 2 connections at startup, max 10. Reused across all requests.
 # This eliminates the per-call connect overhead → much faster responses.
 _pool: psycopg_pool.ConnectionPool | None = None
+_bot_me_username: str | None = None   # cached once at startup → no repeated API calls
 
 def get_pool() -> psycopg_pool.ConnectionPool:
     global _pool
@@ -386,12 +386,26 @@ def generate_vplink(long_url: str) -> str | None:
         return None
 
 
-def create_verification_link(bot_username: str, user_id: int) -> str | None:
+async def generate_vplink_async(long_url: str) -> str | None:
+    """Non-blocking wrapper — runs VPLink HTTP call in a thread pool."""
+    return await asyncio.to_thread(generate_vplink, long_url)
+
+
+def create_verification_link_sync(bot_username: str, user_id: int) -> str | None:
     token     = str(int(time.time()))
     db_save_verification_token(user_id, token)
     deep_link = f"https://t.me/{bot_username}?start=verify_{user_id}_{token}"
     logger.info(f"Deep link: {deep_link}")
     return generate_vplink(deep_link)
+
+
+async def create_verification_link_async(bot_username: str, user_id: int) -> str | None:
+    """Async version — does not block the event loop during HTTP call."""
+    token     = str(int(time.time()))
+    db_save_verification_token(user_id, token)
+    deep_link = f"https://t.me/{bot_username}?start=verify_{user_id}_{token}"
+    logger.info(f"Deep link: {deep_link}")
+    return await generate_vplink_async(deep_link)
 
 
 # ─────────────────────────── VIDEO SENDER ───────────────────────────────────
@@ -557,22 +571,21 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hours = db_get_access_hours()
                 db_set_access(user.id, hours)
 
-                # Send a temporary success message, then delete it after 3s
-                # Then immediately show the video for a clean UX
                 success_msg = await update.message.reply_text(
-                    f"✅ Access unlocked for {hours} hours!\n"
-                    "🎉 Enjoy unlimited videos!"
+                    f"✅ <b>Access unlocked for {hours} hours!</b>\n"
+                    "🎉 Enjoy unlimited videos!",
+                    parse_mode=ParseMode.HTML,
                 )
-                # Delete the /start command message too (if possible)
                 try:
                     await update.message.delete()
                 except TelegramError:
                     pass
 
-                # Show video immediately
-                await show_video(context, user.id, chat_id, index=0)
+                # Resume from where user left off
+                db_user   = db_get_user(user.id)
+                saved_idx = (db_user.get("current_index") or 0) if db_user else 0
+                await show_video(context, user.id, chat_id, index=saved_idx)
 
-                # Auto-delete success message after 4 seconds
                 context.application.create_task(
                     auto_delete_message(context, chat_id, success_msg.message_id, 4)
                 )
@@ -589,17 +602,30 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Normal /start ──
-    welcome_msg = await update.message.reply_text(
-        f"👋 Welcome, {user.first_name}!\n\n"
-        f"🎬 {FREE_VIDEOS_PER_DAY} free videos/day\n"
-        "Use ⬅ / ➡ to browse\n\n"
-        "🚀 Loading first video..."
-    )
-    await show_video(context, user.id, chat_id, index=0)
+    db_user   = db_get_user(user.id)
+    saved_idx = (db_user.get("current_index") or 0) if db_user else 0
+    total     = db_get_video_count()
 
-    # Auto-delete welcome message after 5 seconds for clean UI
+    if saved_idx > 0 and total > 0:
+        # User wapas aaya — saved position se resume karo
+        resume_msg = await update.message.reply_text(
+            f"👋 Welcome back, {user.first_name}!\n\n"
+            f"▶️ Resuming from video <b>{saved_idx + 1}</b> of {total}…",
+            parse_mode=ParseMode.HTML,
+        )
+        await show_video(context, user.id, chat_id, index=saved_idx)
+    else:
+        resume_msg = await update.message.reply_text(
+            f"👋 Welcome, {user.first_name}!\n\n"
+            f"🎬 {FREE_VIDEOS_PER_DAY} free videos/day\n"
+            "Use ⬅ / ➡ to browse\n\n"
+            "🚀 Loading first video…"
+        )
+        await show_video(context, user.id, chat_id, index=0)
+
+    # Auto-delete welcome/resume message after 5 seconds for clean UI
     context.application.create_task(
-        auto_delete_message(context, chat_id, welcome_msg.message_id, 5)
+        auto_delete_message(context, chat_id, resume_msg.message_id, 5)
     )
 
 
@@ -669,17 +695,22 @@ async def _send_access_gate(
     chat_id: int,
     user_id: int,
 ):
-    """Sends the VPLink access gate message."""
-    bot_me    = await context.bot.get_me()
-    short_url = create_verification_link(bot_me.username, user_id)
+    """Sends the VPLink access gate message (async — non-blocking HTTP)."""
+    global _bot_me_username
+    if not _bot_me_username:
+        bot_me = await context.bot.get_me()
+        _bot_me_username = bot_me.username
+
+    short_url = await create_verification_link_async(_bot_me_username, user_id)
 
     if short_url:
         kb = [[InlineKeyboardButton("🔗 Get Free Access", url=short_url)]]
         await context.bot.send_message(
             chat_id,
-            "🔒 Daily limit reached!\n\n"
-            "✨ Verify below to unlock unlimited access.",
-            reply_markup=InlineKeyboardMarkup(kb)
+            "🔒 <b>Daily limit reached!</b>\n\n"
+            "✨ Tap below to unlock <b>unlimited access</b> for free.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML,
         )
     else:
         await context.bot.send_message(
@@ -938,7 +969,7 @@ def main():
 
     app.job_queue.run_repeating(check_expiry_job, interval=300, first=60)
 
-    logger.info("Bot started (v2 — pooled connections, random mode, clean verify UI).")
+    logger.info("Bot started (v3 — resume position, async VPLink, cached bot_me, clean UI).")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
