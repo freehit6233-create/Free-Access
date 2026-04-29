@@ -723,14 +723,60 @@ async def _send_access_gate(
 
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.channel_post or update.message
-    if not message or message.chat_id != SOURCE_CHANNEL_ID:
+    if not message:
+        logger.warning("channel_post_handler: update has no message/channel_post")
         return
+
+    logger.info(
+        f"Channel post received | chat_id={message.chat_id} "
+        f"expected={SOURCE_CHANNEL_ID} "
+        f"has_video={bool(message.video)} "
+        f"has_doc={bool(message.document)}"
+    )
+
+    if message.chat_id != SOURCE_CHANNEL_ID:
+        logger.warning(
+            f"Ignoring post from chat_id={message.chat_id} "
+            f"(expected SOURCE_CHANNEL_ID={SOURCE_CHANNEL_ID})"
+        )
+        return
+
     if message.video:
         db_save_video(message.video.file_id)
+        logger.info(f"Video saved (video type): {message.video.file_id[:30]}")
     elif (message.document
           and message.document.mime_type
           and "video" in message.document.mime_type):
         db_save_video(message.document.file_id)
+        logger.info(f"Video saved (document type): {message.document.file_id[:30]}")
+    else:
+        logger.info("Channel post received but no video found — skipped.")
+
+
+# ─────────────────────────── ADMIN: /setchannel ────────────────────────────
+
+async def setchannel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    fwd_chat = getattr(update.message, "forward_from_chat", None)
+    if not fwd_chat:
+        origin = getattr(update.message, "forward_origin", None)
+        fwd_chat = getattr(origin, "chat", None) if origin else None
+    if fwd_chat:
+        cid   = str(fwd_chat.id)
+        title = str(fwd_chat.title)
+        msg = ("📋 Channel found!\n\n"
+               "Title: <b>" + title + "</b>\n"
+               "chat_id: <code>" + cid + "</code>\n\n"
+               "Set SOURCE_CHANNEL_ID=" + cid + " in env vars.")
+        await update.message.reply_text(msg, parse_mode="HTML")
+        return
+    msg = ("📡 <b>Channel Debug</b>\n\n"
+           "SOURCE_CHANNEL_ID: <code>" + str(SOURCE_CHANNEL_ID) + "</code>\n\n"
+           "To find your private channel ID:\n"
+           "Forward any message FROM the channel to this chat.")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 # ─────────────────────────── ADMIN: /status ─────────────────────────────────
@@ -922,6 +968,7 @@ async def setup_commands(app: Application):
         BotCommand("users",     "👥 User stats"),
         BotCommand("broadcast", "📢 Broadcast a message"),
         BotCommand("settimer",  "⏱ Set access duration"),
+        BotCommand("setchannel", "📡 Debug channel ID"),
         BotCommand("help",      "❓ Help"),
     ]
 
@@ -957,6 +1004,7 @@ def main():
     app.add_handler(CommandHandler("users",     users_handler))
     app.add_handler(CommandHandler("broadcast", broadcast_handler))
     app.add_handler(CommandHandler("settimer",  settimer_handler))
+    app.add_handler(CommandHandler("setchannel", setchannel_handler))
 
     # Nav callbacks: prev/next AND random button
     app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^nav_(next|prev)_\d+$"))
@@ -970,7 +1018,14 @@ def main():
     app.job_queue.run_repeating(check_expiry_job, interval=300, first=60)
 
     logger.info("Bot started (v3 — resume position, async VPLink, cached bot_me, clean UI).")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(
+        allowed_updates=[
+            Update.MESSAGE,
+            Update.CALLBACK_QUERY,
+            Update.CHANNEL_POST,   # ← private channel videos ke liye ZARURI
+        ],
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
