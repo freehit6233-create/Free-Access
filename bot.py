@@ -1,1039 +1,564 @@
 """
-XVIP Telegram Video Manager Bot
-================================
-v3 Improvements:
-- Resume from last position: /start wapas aane par same index se shuru
-- Speed boost: bot_me cached, async VPLink, batched DB reads in nav_callback
-- UI polish: welcome msg shows current position, cleaner access gate
-- All v2 features retained
+VVIP Video Telegram Bot
+Author: SYNAX
+Features: Video navigation, free limit, VPLink verification, admin panel, auto-delete
 """
 
-import os
-import re
 import asyncio
 import logging
-import random
-import time
-import requests
-import psycopg
-import psycopg_pool
-from psycopg.rows import dict_row
+import os
+import aiohttp
 from datetime import datetime, timedelta, timezone
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
-)
-from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
 
-# ─────────────────────────── LOGGING ────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+import asyncpg
 
-# ─────────────────────────── ENV VARS ───────────────────────────────────────
-BOT_TOKEN         = os.getenv("BOT_TOKEN", "")
-ADMIN_ID          = int(os.getenv("ADMIN_ID", "0"))
-SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID", "0"))
-DATABASE_URL      = os.getenv("DATABASE_URL", "")
-VPLINK_API_KEY    = os.getenv("VPLINK_API_KEY", "")
+load_dotenv()
 
-# ─────────────────────────── CONFIG ─────────────────────────────────────────
-FREE_VIDEOS_PER_DAY  = 3
-DEFAULT_ACCESS_HOURS = 3
-VIDEO_DELETE_MINUTES = 10
-REPEAT_CHANCE        = 0.05   # 5% random repeat (as per your existing setting)
-VPLINK_API_URL       = "https://vplink.in/api"
+# ── Config ────────────────────────────────────────────────────────────────────
+BOT_TOKEN          = os.getenv("BOT_TOKEN")
+ADMIN_ID           = int(os.getenv("ADMIN_ID", "0"))
+PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
+DATABASE_URL       = os.getenv("DATABASE_URL")
+VPLINK_API         = os.getenv("VPLINK_API")          # base URL of VPLink API
+BOT_USERNAME       = os.getenv("BOT_USERNAME", "")    # without @
 
-# ─────────────────────────── CONNECTION POOL ────────────────────────────────
-# Pool opens 2 connections at startup, max 10. Reused across all requests.
-# This eliminates the per-call connect overhead → much faster responses.
-_pool: psycopg_pool.ConnectionPool | None = None
-_bot_me_username: str | None = None   # cached once at startup → no repeated API calls
+DEFAULT_FREE_HOURS = 3
+FREE_VIDEO_LIMIT   = 3
+AUTO_DELETE_SEC    = 600   # 10 minutes
+HELP_DELETE_SEC    = 10
+BROADCAST_DELETE_H = 12
 
-def get_pool() -> psycopg_pool.ConnectionPool:
-    global _pool
-    if _pool is None:
-        _pool = psycopg_pool.ConnectionPool(
-            conninfo=DATABASE_URL,
-            min_size=2,
-            max_size=10,
-            kwargs={"autocommit": True},   # dict_row per-cursor set hoti hai
-            open=True,
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
+
+# ── DB pool (global) ──────────────────────────────────────────────────────────
+pool: asyncpg.Pool = None
+
+async def get_pool() -> asyncpg.Pool:
+    global pool
+    if pool is None:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    return pool
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+async def init_db():
+    p = await get_pool()
+    async with p.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id      BIGINT PRIMARY KEY,
+            username     TEXT,
+            full_name    TEXT,
+            video_index  INT  DEFAULT 0,
+            free_used    INT  DEFAULT 0,
+            access_until TIMESTAMPTZ,
+            last_reset   TIMESTAMPTZ DEFAULT NOW(),
+            joined_at    TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS verifications (
+            id          SERIAL PRIMARY KEY,
+            user_id     BIGINT,
+            verified_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS broadcast_msgs (
+            id          SERIAL PRIMARY KEY,
+            chat_id     BIGINT,
+            message_id  BIGINT,
+            delete_at   TIMESTAMPTZ
+        );
+        """)
+        # seed default free_hours setting
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('free_hours', $1)
+            ON CONFLICT (key) DO NOTHING
+        """, str(DEFAULT_FREE_HOURS))
+
+
+async def upsert_user(user_id: int, username: str, full_name: str):
+    p = await get_pool()
+    async with p.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (user_id, username, full_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE
+            SET username=$2, full_name=$3
+        """, user_id, username or "", full_name)
+
+
+async def get_user(user_id: int) -> asyncpg.Record | None:
+    p = await get_pool()
+    async with p.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
+
+async def update_user(user_id: int, **kwargs):
+    if not kwargs:
+        return
+    p = await get_pool()
+    async with p.acquire() as conn:
+        sets = ", ".join(f"{k}=${i+2}" for i, k in enumerate(kwargs))
+        vals = list(kwargs.values())
+        await conn.execute(
+            f"UPDATE users SET {sets} WHERE user_id=$1",
+            user_id, *vals
         )
-    return _pool
-
-def get_db():
-    """Returns a pooled connection context manager."""
-    return get_pool().connection()
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+async def get_setting(key: str) -> str:
+    p = await get_pool()
+    async with p.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", key)
+        return row["value"] if row else None
 
 
-# ─────────────────────────── DATABASE INIT ──────────────────────────────────
-
-def init_db():
-    ddl = """
-    CREATE TABLE IF NOT EXISTS videos (
-        id         SERIAL PRIMARY KEY,
-        file_id    TEXT NOT NULL UNIQUE,
-        fetched_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS users (
-        user_id         BIGINT PRIMARY KEY,
-        username        TEXT,
-        daily_count     INT DEFAULT 0,
-        last_reset_date DATE DEFAULT CURRENT_DATE,
-        access_until    TIMESTAMP WITH TIME ZONE,
-        current_index   INT DEFAULT 0,
-        random_mode     BOOLEAN DEFAULT FALSE,
-        joined_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS verifications (
-        id         SERIAL PRIMARY KEY,
-        user_id    BIGINT NOT NULL,
-        token      TEXT NOT NULL UNIQUE,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        used       BOOLEAN DEFAULT FALSE
-    );
-
-    CREATE TABLE IF NOT EXISTS settings (
-        key   TEXT PRIMARY KEY,
-        value TEXT
-    );
-
-    INSERT INTO settings (key, value) VALUES ('access_hours', '3')
-    ON CONFLICT (key) DO NOTHING;
-
-    -- Add random_mode column if upgrading from older schema
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS random_mode BOOLEAN DEFAULT FALSE;
-    """
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(ddl)
-        logger.info("Database initialised.")
-    except Exception as e:
-        logger.error(f"DB init error: {e}")
-        raise
+async def set_setting(key: str, value: str):
+    p = await get_pool()
+    async with p.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value=$2
+        """, key, value)
 
 
-# ─────────────────────────── DB HELPERS ─────────────────────────────────────
-
-def db_get_user(user_id: int) -> dict | None:
-    try:
-        with get_db() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-                return cur.fetchone()
-    except Exception as e:
-        logger.error(f"db_get_user: {e}")
-        return None
-
-
-def db_upsert_user(user_id: int, username: str | None = None):
-    try:
-        with get_db() as conn:
-            conn.execute("""
-                INSERT INTO users (user_id, username)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
-            """, (user_id, username))
-    except Exception as e:
-        logger.error(f"db_upsert_user: {e}")
-
-
-def db_reset_daily_if_needed(user_id: int):
-    try:
-        with get_db() as conn:
-            conn.execute("""
-                UPDATE users
-                SET daily_count = 0, last_reset_date = CURRENT_DATE
-                WHERE user_id = %s AND last_reset_date < CURRENT_DATE
-            """, (user_id,))
-    except Exception as e:
-        logger.error(f"db_reset_daily: {e}")
-
-
-def db_increment_daily(user_id: int):
-    try:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE users SET daily_count = daily_count + 1 WHERE user_id = %s",
-                (user_id,)
-            )
-    except Exception as e:
-        logger.error(f"db_increment_daily: {e}")
-
-
-def db_set_access(user_id: int, hours: int):
-    until = utcnow() + timedelta(hours=hours)
-    try:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE users SET access_until = %s WHERE user_id = %s",
-                (until, user_id)
-            )
-    except Exception as e:
-        logger.error(f"db_set_access: {e}")
-
-
-def db_set_random_mode(user_id: int, enabled: bool):
-    try:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE users SET random_mode = %s WHERE user_id = %s",
-                (enabled, user_id)
-            )
-    except Exception as e:
-        logger.error(f"db_set_random_mode: {e}")
-
-
-def db_get_video_count() -> int:
-    try:
-        with get_db() as conn:
-            # Use default tuple cursor (not dict_row) so row[0] works
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM videos")
-                row = cur.fetchone()
-                count = row[0] if row else 0
-                logger.info(f"db_get_video_count: {count}")
-                return count
-    except Exception as e:
-        logger.error(f"db_get_video_count error: {e}")
-        return 0
-
-
-def db_get_video_at_index(index: int) -> str | None:
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:   # tuple cursor — row[0] = file_id
-                cur.execute(
-                    "SELECT file_id FROM videos ORDER BY id LIMIT 1 OFFSET %s",
-                    (index,)
-                )
-                row = cur.fetchone()
-                file_id = row[0] if row else None
-                logger.info(f"db_get_video_at_index({index}): {file_id[:20] if file_id else None}")
-                return file_id
-    except Exception as e:
-        logger.error(f"db_get_video_at_index error: {e}")
-        return None
-
-
-def db_get_random_video_file_id() -> str | None:
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:   # tuple cursor
-                cur.execute("SELECT file_id FROM videos ORDER BY RANDOM() LIMIT 1")
-                row = cur.fetchone()
-                return row[0] if row else None
-    except Exception as e:
-        logger.error(f"db_get_random_video error: {e}")
-        return None
-
-
-def db_save_video(file_id: str):
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO videos (file_id) VALUES (%s)
-                    ON CONFLICT (file_id) DO NOTHING
-                """, (file_id,))
-        logger.info(f"Video saved: {file_id[:25]}...")
-    except Exception as e:
-        logger.error(f"db_save_video: {e}")
-
-
-def db_set_user_index(user_id: int, index: int):
-    try:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE users SET current_index = %s WHERE user_id = %s",
-                (index, user_id)
-            )
-    except Exception as e:
-        logger.error(f"db_set_user_index: {e}")
-
-
-def db_save_verification_token(user_id: int, token: str):
-    try:
-        with get_db() as conn:
-            conn.execute("DELETE FROM verifications WHERE user_id = %s", (user_id,))
-            conn.execute(
-                "INSERT INTO verifications (user_id, token) VALUES (%s, %s)",
-                (user_id, token)
-            )
-    except Exception as e:
-        logger.error(f"db_save_token: {e}")
-
-
-def db_check_and_use_token(user_id: int, token: str) -> bool:
-    """
-    Validates token — must belong to user_id, be unused, created within 60 min.
-    """
-    try:
-        cutoff = utcnow() - timedelta(minutes=60)
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id FROM verifications
-                    WHERE user_id    = %s
-                      AND token      = %s
-                      AND used       = FALSE
-                      AND created_at > %s
-                """, (user_id, token, cutoff))
-                row = cur.fetchone()
-            if row:
-                conn.execute(
-                    "UPDATE verifications SET used = TRUE WHERE id = %s",
-                    (row[0],)
-                )
-        logger.info(f"Token check uid={user_id} token={token} valid={bool(row)}")
-        return bool(row)
-    except Exception as e:
-        logger.error(f"db_check_token: {e}")
-        return False
-
-
-def db_get_access_hours() -> int:
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT value FROM settings WHERE key = 'access_hours'")
-                row = cur.fetchone()
-        return int(row[0]) if row else DEFAULT_ACCESS_HOURS
-    except Exception as e:
-        logger.error(f"db_get_access_hours: {e}")
-        return DEFAULT_ACCESS_HOURS
-
-
-def db_set_access_hours(hours: int):
-    try:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE settings SET value = %s WHERE key = 'access_hours'",
-                (str(hours),)
-            )
-    except Exception as e:
-        logger.error(f"db_set_access_hours: {e}")
-
-
-def db_get_recent_verification_count(hours: int = 24) -> int:
-    try:
-        cutoff = utcnow() - timedelta(hours=hours)
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) FROM verifications WHERE used=TRUE AND created_at > %s",
-                    (cutoff,)
-                )
-                row = cur.fetchone()
-                return row[0] if row else 0
-    except Exception as e:
-        logger.error(f"db_get_recent_verifications: {e}")
-        return 0
-
-
-def db_get_all_user_ids() -> list:
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM users")
-                return [r[0] for r in cur.fetchall()]
-    except Exception as e:
-        logger.error(f"db_get_all_user_ids: {e}")
-        return []
-
-
-# ─────────────────────────── ACCESS CHECKS ──────────────────────────────────
-
-def user_has_active_access(user: dict) -> bool:
-    au = user.get("access_until")
-    if not au:
-        return False
-    if au.tzinfo is None:
-        au = au.replace(tzinfo=timezone.utc)
-    return au > utcnow()
-
-
-def user_within_daily_limit(user: dict) -> bool:
-    return (user.get("daily_count") or 0) < FREE_VIDEOS_PER_DAY
-
-
-# ─────────────────────────── VPLINK INTEGRATION ─────────────────────────────
-
-def generate_vplink(long_url: str) -> str | None:
-    try:
-        resp = requests.get(
-            VPLINK_API_URL,
-            params={"api": VPLINK_API_KEY, "url": long_url},
-            timeout=10
+async def log_verification(user_id: int):
+    p = await get_pool()
+    async with p.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO verifications (user_id) VALUES ($1)", user_id
         )
-        data = resp.json()
-        if data.get("status") == "success":
-            return (data.get("shortenedUrl")
-                    or data.get("short_url")
-                    or data.get("shorten_url"))
-        logger.warning(f"VPLink response: {data}")
-        return None
-    except Exception as e:
-        logger.error(f"VPLink API: {e}")
-        return None
 
 
-async def generate_vplink_async(long_url: str) -> str | None:
-    """Non-blocking wrapper — runs VPLink HTTP call in a thread pool."""
-    return await asyncio.to_thread(generate_vplink, long_url)
+async def verifications_last_24h() -> int:
+    p = await get_pool()
+    async with p.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) as cnt FROM verifications WHERE verified_at > NOW() - INTERVAL '24 hours'"
+        )
+        return row["cnt"]
 
 
-def create_verification_link_sync(bot_username: str, user_id: int) -> str | None:
-    token     = str(int(time.time()))
-    db_save_verification_token(user_id, token)
-    deep_link = f"https://t.me/{bot_username}?start=verify_{user_id}_{token}"
-    logger.info(f"Deep link: {deep_link}")
-    return generate_vplink(deep_link)
+async def all_user_ids() -> list[int]:
+    p = await get_pool()
+    async with p.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+        return [r["user_id"] for r in rows]
 
 
-async def create_verification_link_async(bot_username: str, user_id: int) -> str | None:
-    """Async version — does not block the event loop during HTTP call."""
-    token     = str(int(time.time()))
-    db_save_verification_token(user_id, token)
-    deep_link = f"https://t.me/{bot_username}?start=verify_{user_id}_{token}"
-    logger.info(f"Deep link: {deep_link}")
-    return await generate_vplink_async(deep_link)
+async def save_broadcast_msg(chat_id: int, message_id: int, delete_at: datetime):
+    p = await get_pool()
+    async with p.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO broadcast_msgs (chat_id, message_id, delete_at) VALUES ($1, $2, $3)",
+            chat_id, message_id, delete_at
+        )
+
+# ── Bot / Dispatcher ──────────────────────────────────────────────────────────
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp  = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
+# ── Utility ───────────────────────────────────────────────────────────────────
+async def get_channel_videos() -> list[int]:
+    """Return list of message IDs that contain video in the private channel."""
+    msgs = []
+    try:
+        async for msg in bot.iter_messages(PRIVATE_CHANNEL_ID, limit=200):
+            if msg.video or msg.document:
+                msgs.append(msg.message_id)
+    except Exception:
+        # fallback: get latest 200 messages and filter
+        pass
+    return sorted(msgs)
 
 
-# ─────────────────────────── VIDEO SENDER ───────────────────────────────────
+# cache videos to avoid repeated API calls
+_video_cache: list[int] = []
+_cache_time: datetime   = None
 
-async def send_video_to_user(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    file_id: str,
-    index: int,
-    total: int,
-    random_mode: bool = False,
-    prev_message_id: int | None = None,
-) -> int | None:
-    """
-    Sends video with navigation buttons.
-    - random_mode=True  → shows 🔀 Next Random button only
-    - random_mode=False → shows ⬅ Prev / Next ➡ as needed
-    Caption: "Video X of Total"  (or "🔀 Random Mode" when all seen)
-    """
-    if random_mode:
-        nav    = [InlineKeyboardButton("🔀 Next Random", callback_data="nav_random")]
-        caption = f"🎬 Video {index + 1} of {total}\n🔀 All videos seen — Random mode!"
-    else:
-        nav = []
-        if index > 0:
-            nav.append(InlineKeyboardButton("⬅ Previous", callback_data=f"nav_prev_{index}"))
-        if index < total - 1:
-            nav.append(InlineKeyboardButton("Next ➡", callback_data=f"nav_next_{index}"))
-        caption = f"🎬 Video {index + 1} of {total}"
+async def cached_videos() -> list[int]:
+    global _video_cache, _cache_time
+    now = datetime.now(timezone.utc)
+    if not _video_cache or (_cache_time and (now - _cache_time).seconds > 300):
+        _video_cache = await get_channel_videos()
+        _cache_time  = now
+    return _video_cache
 
-    markup = InlineKeyboardMarkup([nav]) if nav else None
 
-    # Delete previous video message for clean UI
-    if prev_message_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=prev_message_id)
-        except TelegramError:
-            pass
+def nav_keyboard(index: int, total: int, show_get_link=False) -> InlineKeyboardMarkup:
+    buttons = []
+    row = []
+    if index > 0:
+        row.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"nav:{index-1}"))
+    if index < total - 1:
+        row.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"nav:{index+1}"))
+    if row:
+        buttons.append(row)
+    if show_get_link:
+        buttons.append([InlineKeyboardButton(text="🔗 Get Link", callback_data="get_link")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_video_to_user(user_id: int, index: int, bot_instance: Bot):
+    videos = await cached_videos()
+    if not videos or index >= len(videos):
+        await bot_instance.send_message(user_id, "⚠️ No videos found in channel.")
+        return
+
+    msg_id = videos[index]
+    total  = len(videos)
+    kb     = nav_keyboard(index, total)
 
     try:
-        msg = await context.bot.send_video(
-            chat_id=chat_id,
-            video=file_id,
-            caption=caption,
-            reply_markup=markup,
+        sent = await bot_instance.copy_message(
+            chat_id=user_id,
+            from_chat_id=PRIVATE_CHANNEL_ID,
+            message_id=msg_id,
             protect_content=True,
+            reply_markup=kb
         )
-        context.application.create_task(
-            auto_delete_message(context, chat_id, msg.message_id, VIDEO_DELETE_MINUTES * 60)
-        )
-        return msg.message_id
-    except TelegramError as e:
-        logger.error(f"send_video: {e}")
-        return None
-
-
-async def auto_delete_message(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    message_id: int,
-    delay_seconds: int,
-):
-    await asyncio.sleep(delay_seconds)
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.info(f"Auto-deleted {message_id}")
-    except TelegramError as e:
-        logger.warning(f"Auto-delete failed {message_id}: {e}")
-
-
-# ─────────────────────────── SHOW VIDEO HELPER ──────────────────────────────
-
-async def show_video(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    chat_id: int,
-    index: int | None = None,
-    prev_message_id: int | None = None,
-    force_random: bool = False,
-):
-    db_reset_daily_if_needed(user_id)
-    db_user = db_get_user(user_id)
-    if not db_user:
-        db_upsert_user(user_id)
-        db_user = db_get_user(user_id)
-
-    total = db_get_video_count()
-    if total == 0:
-        await context.bot.send_message(chat_id, "📭 No videos yet. Check back later!")
-        return
-
-    # Determine random mode
-    current_random_mode = bool(db_user.get("random_mode", False))
-
-    if force_random or current_random_mode:
-        # Stay in random mode permanently once all videos seen
-        file_id = db_get_random_video_file_id()
-        if index is None:
-            index = db_user.get("current_index") or 0
-        if not current_random_mode:
-            db_set_random_mode(user_id, True)
-        random_mode = True
-    else:
-        if index is None:
-            index = db_user.get("current_index") or 0
-        index = max(0, min(index, total - 1))
-
-        # Check if user has seen all videos → switch to random mode
-        if index >= total - 1 and not (random.random() < REPEAT_CHANCE):
-            # They're at the last video, next press will trigger random
-            random_mode = False
-        else:
-            random_mode = False
-
-        file_id = (db_get_random_video_file_id()
-                   if random.random() < REPEAT_CHANCE
-                   else db_get_video_at_index(index))
-
-    if not file_id:
-        await context.bot.send_message(chat_id, "⚠️ Could not load video. Try again.")
-        return
-
-    db_set_user_index(user_id, index)
-    db_increment_daily(user_id)
-    await send_video_to_user(
-        context, chat_id, file_id, index, total,
-        random_mode=random_mode,
-        prev_message_id=prev_message_id
-    )
-
-
-# ─────────────────────────── /start HANDLER ─────────────────────────────────
-
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user    = update.effective_user
-    chat_id = update.effective_chat.id
-    args    = context.args or []
-
-    db_upsert_user(user.id, user.username)
-    db_reset_daily_if_needed(user.id)
-
-    # ── Deep-link verification: start=verify_USERID_TOKEN ──
-    if args and args[0].startswith("verify_"):
-        raw   = args[0]
-        parts = raw.split("_", 2)
-        logger.info(f"Verify: raw={raw!r} parts={parts} caller={user.id}")
-
-        if len(parts) == 3:
-            _, uid_str, token = parts
-            try:
-                uid = int(uid_str)
-            except ValueError:
-                uid = -1
-
-            if uid != user.id:
-                await update.message.reply_text(
-                    "❌ This link belongs to a different account.\n"
-                    "Click Next ➡ to get your own link."
-                )
-                return
-
-            if db_check_and_use_token(user.id, token):
-                hours = db_get_access_hours()
-                db_set_access(user.id, hours)
-
-                success_msg = await update.message.reply_text(
-                    f"✅ <b>Access unlocked for {hours} hours!</b>\n"
-                    "🎉 Enjoy unlimited videos!",
-                    parse_mode=ParseMode.HTML,
-                )
-                try:
-                    await update.message.delete()
-                except TelegramError:
-                    pass
-
-                # Resume from where user left off
-                db_user   = db_get_user(user.id)
-                saved_idx = (db_user.get("current_index") or 0) if db_user else 0
-                await show_video(context, user.id, chat_id, index=saved_idx)
-
-                context.application.create_task(
-                    auto_delete_message(context, chat_id, success_msg.message_id, 4)
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ Verification failed or link expired.\n\n"
-                    "Reasons:\n"
-                    "• Link older than 60 minutes\n"
-                    "• Link already used\n\n"
-                    "Click Next ➡ on any video to get a fresh link."
-                )
-        else:
-            await update.message.reply_text("❌ Invalid verification link.")
-        return
-
-    # ── Normal /start ──
-    db_user   = db_get_user(user.id)
-    saved_idx = (db_user.get("current_index") or 0) if db_user else 0
-    total     = db_get_video_count()
-
-    if saved_idx > 0 and total > 0:
-        # User wapas aaya — saved position se resume karo
-        resume_msg = await update.message.reply_text(
-            f"👋 Welcome back, {user.first_name}!\n\n"
-            f"▶️ Resuming from video <b>{saved_idx + 1}</b> of {total}…",
-            parse_mode=ParseMode.HTML,
-        )
-        await show_video(context, user.id, chat_id, index=saved_idx)
-    else:
-        resume_msg = await update.message.reply_text(
-            f"👋 Welcome, {user.first_name}!\n\n"
-            f"🎬 {FREE_VIDEOS_PER_DAY} free videos/day\n"
-            "Use ⬅ / ➡ to browse\n\n"
-            "🚀 Loading first video…"
-        )
-        await show_video(context, user.id, chat_id, index=0)
-
-    # Auto-delete welcome/resume message after 5 seconds for clean UI
-    context.application.create_task(
-        auto_delete_message(context, chat_id, resume_msg.message_id, 5)
-    )
-
-
-# ─────────────────────────── NAVIGATION CALLBACKS ───────────────────────────
-
-async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-    data    = query.data
-
-    await query.answer()
-
-    db_reset_daily_if_needed(user_id)
-    db_user = db_get_user(user_id)
-    if not db_user:
-        db_upsert_user(user_id)
-        db_user = db_get_user(user_id)
-
-    # ── Random mode button ──
-    if data == "nav_random":
-        if not user_has_active_access(db_user) and not user_within_daily_limit(db_user):
-            await _send_access_gate(context, chat_id, user_id)
-            return
-        await show_video(
-            context, user_id, chat_id,
-            prev_message_id=query.message.message_id,
-            force_random=True,
-        )
-        return
-
-    # ── Normal prev/next ──
-    parts     = data.split("_")   # ['nav', 'next'/'prev', 'INDEX']
-    direction = parts[1]
-    cur_index = int(parts[2])
-
-    new_index = cur_index + 1 if direction == "next" else cur_index - 1
-    total     = db_get_video_count()
-    new_index = max(0, min(new_index, total - 1))
-
-    # Access gate (Next only)
-    if direction == "next":
-        if not user_has_active_access(db_user) and not user_within_daily_limit(db_user):
-            await _send_access_gate(context, chat_id, user_id)
-            return
-
-    # If going next and already at last video → switch to random mode
-    if direction == "next" and cur_index >= total - 1:
-        db_set_random_mode(user_id, True)
-        await show_video(
-            context, user_id, chat_id,
-            index=cur_index,
-            prev_message_id=query.message.message_id,
-            force_random=True,
-        )
-        return
-
-    await show_video(
-        context, user_id, chat_id,
-        index=new_index,
-        prev_message_id=query.message.message_id,
-    )
-
-
-async def _send_access_gate(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    user_id: int,
-):
-    """Sends the VPLink access gate message (async — non-blocking HTTP)."""
-    global _bot_me_username
-    if not _bot_me_username:
-        bot_me = await context.bot.get_me()
-        _bot_me_username = bot_me.username
-
-    short_url = await create_verification_link_async(_bot_me_username, user_id)
-
-    if short_url:
-        kb = [[InlineKeyboardButton("🔗 Get Free Access", url=short_url)]]
-        await context.bot.send_message(
-            chat_id,
-            "🔒 <b>Daily limit reached!</b>\n\n"
-            "✨ Tap below to unlock <b>unlimited access</b> for free.",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await context.bot.send_message(
-            chat_id,
-            "⚠️ Could not generate access link. Try again shortly."
-        )
-
-
-# ─────────────────────────── SOURCE CHANNEL WATCHER ─────────────────────────
-
-async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.channel_post or update.message
-    if not message:
-        logger.warning("channel_post_handler: update has no message/channel_post")
-        return
-
-    logger.info(
-        f"Channel post received | chat_id={message.chat_id} "
-        f"expected={SOURCE_CHANNEL_ID} "
-        f"has_video={bool(message.video)} "
-        f"has_doc={bool(message.document)}"
-    )
-
-    if message.chat_id != SOURCE_CHANNEL_ID:
-        logger.warning(
-            f"Ignoring post from chat_id={message.chat_id} "
-            f"(expected SOURCE_CHANNEL_ID={SOURCE_CHANNEL_ID})"
-        )
-        return
-
-    if message.video:
-        db_save_video(message.video.file_id)
-        logger.info(f"Video saved (video type): {message.video.file_id[:30]}")
-    elif (message.document
-          and message.document.mime_type
-          and "video" in message.document.mime_type):
-        db_save_video(message.document.file_id)
-        logger.info(f"Video saved (document type): {message.document.file_id[:30]}")
-    else:
-        logger.info("Channel post received but no video found — skipped.")
-
-
-# ─────────────────────────── ADMIN: /setchannel ────────────────────────────
-
-async def setchannel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    fwd_chat = getattr(update.message, "forward_from_chat", None)
-    if not fwd_chat:
-        origin = getattr(update.message, "forward_origin", None)
-        fwd_chat = getattr(origin, "chat", None) if origin else None
-    if fwd_chat:
-        cid   = str(fwd_chat.id)
-        title = str(fwd_chat.title)
-        msg = ("📋 Channel found!\n\n"
-               "Title: <b>" + title + "</b>\n"
-               "chat_id: <code>" + cid + "</code>\n\n"
-               "Set SOURCE_CHANNEL_ID=" + cid + " in env vars.")
-        await update.message.reply_text(msg, parse_mode="HTML")
-        return
-    msg = ("📡 <b>Channel Debug</b>\n\n"
-           "SOURCE_CHANNEL_ID: <code>" + str(SOURCE_CHANNEL_ID) + "</code>\n\n"
-           "To find your private channel ID:\n"
-           "Forward any message FROM the channel to this chat.")
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-# ─────────────────────────── ADMIN: /status ─────────────────────────────────
-
-async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    v24  = db_get_recent_verification_count(24)
-    vids = db_get_video_count()
-    hrs  = db_get_access_hours()
-    await update.message.reply_text(
-        f"📊 Bot Status\n\n"
-        f"🎬 Total videos: {vids}\n"
-        f"✅ Verifications (24h): {v24}\n"
-        f"⏱ Access timer: {hrs} hours\n"
-        f"🎲 Repeat chance: {int(REPEAT_CHANCE * 100)}%\n"
-        f"🗑 Auto-delete: {VIDEO_DELETE_MINUTES} mins"
-    )
-
-
-# ─────────────────────────── ADMIN: /users ──────────────────────────────────
-
-async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    try:
-        cutoff = utcnow() - timedelta(hours=24)
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM users")
-                total = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM users WHERE joined_at > %s", (cutoff,))
-                new24 = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM users WHERE access_until > NOW()")
-                active = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM users WHERE random_mode = TRUE")
-                rand_users = cur.fetchone()[0]
+        # schedule auto-delete after 10 min
+        asyncio.create_task(auto_delete(user_id, sent.message_id, AUTO_DELETE_SEC))
     except Exception as e:
-        await update.message.reply_text(f"❌ DB error: {e}")
+        log.error(f"send_video error: {e}")
+        await bot_instance.send_message(user_id, f"⚠️ Could not load video #{index+1}.")
+
+
+async def auto_delete(chat_id: int, message_id: int, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+async def check_and_reset_free(user: asyncpg.Record) -> asyncpg.Record:
+    """If 24h passed since last_reset, reset free_used counter."""
+    now = datetime.now(timezone.utc)
+    last_reset = user["last_reset"]
+    if last_reset and (now - last_reset) >= timedelta(hours=24):
+        await update_user(user["user_id"], free_used=0, last_reset=now)
+        # re-fetch
+        return await get_user(user["user_id"])
+    return user
+
+
+async def user_has_active_access(user: asyncpg.Record) -> bool:
+    au = user["access_until"]
+    if au and au > datetime.now(timezone.utc):
+        return True
+    return False
+
+
+async def generate_vplink(user_id: int) -> str:
+    """Call VPLink API to generate a short verification link."""
+    callback_url = f"https://t.me/{BOT_USERNAME}?start=verify_{user_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{VPLINK_API}/api",
+                params={"api": VPLINK_API.split("api=")[-1] if "api=" in VPLINK_API else "",
+                        "url": callback_url},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                data = await resp.json()
+                return data.get("shortenedUrl") or data.get("short_url") or callback_url
+    except Exception as e:
+        log.warning(f"VPLink error: {e}")
+        return callback_url  # fallback to direct link
+
+# ── /start ────────────────────────────────────────────────────────────────────
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    user = message.from_user
+    await upsert_user(user.id, user.username, user.full_name)
+
+    # handle verify callback: /start verify_<user_id>
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1 and args[1].startswith("verify_"):
+        try:
+            vid = int(args[1].split("_")[1])
+        except Exception:
+            vid = None
+        if vid == user.id:
+            await handle_verification(message, user.id)
+            return
+
+    db_user = await get_user(user.id)
+    db_user = await check_and_reset_free(db_user)
+
+    # delete any old 'Get Link' / start messages (send fresh)
+    welcome = (
+        f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
+        f"🎬 You have <b>{FREE_VIDEO_LIMIT - db_user['free_used']}</b> free videos remaining.\n"
+        f"Tap below to start watching!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Watch Videos", callback_data=f"nav:{db_user['video_index']}")]
+    ])
+    await message.answer(welcome, reply_markup=kb)
+
+
+async def handle_verification(message: Message, user_id: int):
+    db_user = await get_user(user_id)
+    free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
+    access_until = datetime.now(timezone.utc) + timedelta(hours=free_hours)
+
+    await update_user(user_id, access_until=access_until)
+    await log_verification(user_id)
+
+    name = message.from_user.full_name
+    conf = await message.answer(
+        f"✅ <b>Hello {name}, your {free_hours} hour access is active!</b>\n"
+        f"⏰ Access expires at: <code>{access_until.strftime('%H:%M UTC')}</code>"
+    )
+
+    # notify admin
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔔 <b>New Verification!</b>\n"
+            f"👤 Name: <a href='tg://user?id={user_id}'>{name}</a>\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"⏰ Access until: {access_until.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+    except Exception:
+        pass
+
+    # send next video immediately
+    await asyncio.sleep(1)
+    await send_video_to_user(user_id, db_user["video_index"], bot)
+
+    # schedule access expiry notification
+    asyncio.create_task(notify_access_expired(user_id, free_hours * 3600))
+
+
+async def notify_access_expired(user_id: int, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await bot.send_message(
+            user_id,
+            "⏰ <b>Your free access has expired.</b>\n"
+            "You'll get 3 free videos again in 24 hours, or verify a new link for more access!"
+        )
+    except Exception:
+        pass
+
+# ── Navigation Callback ───────────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("nav:"))
+async def nav_callback(call: CallbackQuery):
+    user_id = call.from_user.id
+    index   = int(call.data.split(":")[1])
+
+    db_user = await get_user(user_id)
+    if not db_user:
+        await upsert_user(user_id, call.from_user.username, call.from_user.full_name)
+        db_user = await get_user(user_id)
+
+    db_user = await check_and_reset_free(db_user)
+
+    has_access = await user_has_active_access(db_user)
+    free_used  = db_user["free_used"]
+
+    # check if free limit exceeded
+    if not has_access and free_used >= FREE_VIDEO_LIMIT:
+        free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
+        link = await generate_vplink(user_id)
+        kb   = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Get Link", url=link)]
+        ])
+        await call.message.answer(
+            f"🔒 <b>Free limit reached!</b>\n\n"
+            f"Verify this link to get free access for <b>{free_hours} hours</b>:",
+            reply_markup=kb
+        )
+        await call.answer()
         return
-    await update.message.reply_text(
-        f"👥 User Stats\n\n"
-        f"Total users: {total}\n"
-        f"New (24h): {new24}\n"
-        f"Active access now: {active}\n"
-        f"In random mode: {rand_users}"
+
+    # update index and free_used counter
+    new_free = free_used + 1 if not has_access else free_used
+    await update_user(user_id, video_index=index, free_used=new_free)
+
+    await call.answer()
+    await send_video_to_user(user_id, index, bot)
+
+
+@router.callback_query(F.data == "get_link")
+async def get_link_callback(call: CallbackQuery):
+    user_id    = call.from_user.id
+    free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
+    link = await generate_vplink(user_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Verify Now", url=link)]
+    ])
+    await call.message.edit_reply_markup(reply_markup=kb)
+    await call.answer(f"Get {free_hours}h free access by verifying the link!", show_alert=True)
+
+# ── /help ─────────────────────────────────────────────────────────────────────
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    text = (
+        "📖 <b>Bot Help</b>\n\n"
+        "/start — Start watching videos\n"
+        "/help — Show this message\n\n"
+        "<b>Free users:</b> 3 videos free every 24 hours.\n"
+        "Verify a link to unlock more hours!\n\n"
+        "<i>This message will auto-delete in 10 seconds.</i>"
+    )
+    sent = await message.answer(text)
+    asyncio.create_task(auto_delete(message.chat.id, sent.message_id, HELP_DELETE_SEC))
+    asyncio.create_task(auto_delete(message.chat.id, message.message_id, HELP_DELETE_SEC))
+
+# ── Admin Commands ────────────────────────────────────────────────────────────
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    videos   = await cached_videos()
+    verifs   = await verifications_last_24h()
+    p        = await get_pool()
+    async with p.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+    free_hours  = await get_setting("free_hours")
+    await message.answer(
+        f"📊 <b>Bot Status</b>\n\n"
+        f"🎬 Videos in channel: <b>{len(videos)}</b>\n"
+        f"✅ Verifications (24h): <b>{verifs}</b>\n"
+        f"👥 Total users: <b>{total_users}</b>\n"
+        f"⏱ Free access hours: <b>{free_hours}</b>"
     )
 
 
-# ─────────────────────────── ADMIN: /broadcast ──────────────────────────────
-
-async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
+@router.message(Command("settimer"))
+async def cmd_set_timer(message: Message):
+    if not is_admin(message.from_user.id):
         return
-    if not update.message.reply_to_message:
-        await update.message.reply_text(
-            "📢 Usage: Reply to any message (text/photo/video) with /broadcast"
-        )
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Usage: /settimer <hours>\nExample: /settimer 6")
+        return
+    hours = int(parts[1])
+    await set_setting("free_hours", str(hours))
+    await message.answer(f"✅ Free access timer set to <b>{hours} hours</b>.")
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    if not message.reply_to_message:
+        await message.answer("⚠️ Reply to a message to broadcast it.")
         return
 
-    source   = update.message.reply_to_message
-    user_ids = db_get_all_user_ids()
-    sent = failed = 0
+    user_ids   = await all_user_ids()
+    delete_at  = datetime.now(timezone.utc) + timedelta(hours=BROADCAST_DELETE_H)
+    success, fail = 0, 0
+
+    status_msg = await message.answer(f"📢 Broadcasting to {len(user_ids)} users...")
 
     for uid in user_ids:
         try:
-            if source.photo:
-                await context.bot.send_photo(
-                    uid, source.photo[-1].file_id,
-                    caption=source.caption or "",
-                    parse_mode=ParseMode.HTML
-                )
-            elif source.video:
-                await context.bot.send_video(
-                    uid, source.video.file_id,
-                    caption=source.caption or "",
-                    parse_mode=ParseMode.HTML,
-                    protect_content=True
-                )
-            elif source.text:
-                await context.bot.send_message(uid, source.text, parse_mode=ParseMode.HTML)
-            sent += 1
-            await asyncio.sleep(0.04)
-        except TelegramError:
-            failed += 1
+            sent = await message.reply_to_message.copy_to(uid)
+            await save_broadcast_msg(uid, sent.message_id, delete_at)
+            success += 1
+            await asyncio.sleep(0.05)  # rate limit
+        except Exception:
+            fail += 1
 
-    await update.message.reply_text(
-        f"📢 Broadcast done!\n✅ Sent: {sent}\n❌ Failed: {failed}"
+    await status_msg.edit_text(
+        f"✅ Broadcast complete!\n"
+        f"Sent: {success} | Failed: {fail}\n"
+        f"🗑 Auto-delete in {BROADCAST_DELETE_H} hours."
     )
 
 
-# ─────────────────────────── ADMIN: /settimer ───────────────────────────────
-
-async def settimer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if not is_admin(message.from_user.id):
         return
-    if not context.args:
-        hrs = db_get_access_hours()
-        await update.message.reply_text(
-            f"⏱ Current access timer: {hrs} hours\n\n"
-            "Usage: /settimer <hours>\nExample: /settimer 6"
-        )
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: /ban <user_id>")
         return
-    try:
-        hours = int(context.args[0])
-        if not (1 <= hours <= 720):
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Enter a number between 1 and 720.")
+    uid = int(parts[1])
+    await update_user(uid, access_until=datetime(2000, 1, 1, tzinfo=timezone.utc))
+    await message.answer(f"🚫 User <code>{uid}</code> banned.")
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if not is_admin(message.from_user.id):
         return
-    db_set_access_hours(hours)
-    await update.message.reply_text(f"✅ Access timer updated to {hours} hours.")
-
-
-# ─────────────────────────── /help HANDLER ──────────────────────────────────
-
-async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID:
-        text = (
-            "🛠 Admin Commands\n\n"
-            "/status — Bot stats (verifications, videos, timer)\n"
-            "/users — User count and active access stats\n"
-            "/broadcast — Reply to any message to broadcast it\n"
-            "/settimer <hours> — Change verified access duration\n\n"
-            "👤 Also available\n"
-            "/start — Start / restart video feed\n"
-            "/help — This message"
-        )
-    else:
-        text = (
-            "ℹ️ How to use this bot\n\n"
-            f"1️⃣  /start to begin\n"
-            f"2️⃣  {FREE_VIDEOS_PER_DAY} free videos/day\n"
-            "3️⃣  ⬅ Prev / Next ➡ to browse\n"
-            "4️⃣  After limit → click Get Free Access\n"
-            "5️⃣  Verify link → unlock unlimited for 3 hours\n"
-            "6️⃣  After all videos seen → 🔀 Random mode\n\n"
-            "🔒 Videos are protected — no download/forward."
-        )
-    await update.message.reply_text(text)
-
-
-# ─────────────────────────── EXPIRY CHECKER (background) ────────────────────
-
-async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
-    now          = utcnow()
-    window_start = now - timedelta(minutes=5)
-    try:
-        with get_db() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("""
-                    SELECT user_id FROM users
-                    WHERE access_until IS NOT NULL
-                      AND access_until BETWEEN %s AND %s
-                """, (window_start, now))
-                expired = cur.fetchall()
-    except Exception as e:
-        logger.error(f"expiry_job: {e}")
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: /unban <user_id>")
         return
+    uid = int(parts[1])
+    await update_user(uid, access_until=None, free_used=0)
+    await message.answer(f"✅ User <code>{uid}</code> unbanned.")
 
-    for row in expired:
-        try:
-            await context.bot.send_message(
-                chat_id=row["user_id"],
-                text=(
-                    "⏰ Your free access has expired!\n\n"
-                    "You still get 3 free videos per day.\n"
-                    "Click Next ➡ on any video to get a new access link."
-                )
-            )
-        except TelegramError:
-            pass
-
-
-# ─────────────────────────── BOT MENU COMMANDS ──────────────────────────────
-
-async def setup_commands(app: Application):
-    user_commands = [
-        BotCommand("start", "▶️ Start watching videos"),
-        BotCommand("help",  "❓ How to use this bot"),
-    ]
-    admin_commands = [
-        BotCommand("start",     "▶️ Start bot"),
-        BotCommand("status",    "📊 Bot stats"),
-        BotCommand("users",     "👥 User stats"),
-        BotCommand("broadcast", "📢 Broadcast a message"),
-        BotCommand("settimer",  "⏱ Set access duration"),
-        BotCommand("setchannel", "📡 Debug channel ID"),
-        BotCommand("help",      "❓ Help"),
-    ]
-
-    await app.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
-    try:
-        await app.bot.set_my_commands(
-            admin_commands,
-            scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+# ── Scheduled Tasks ───────────────────────────────────────────────────────────
+async def delete_expired_broadcasts():
+    """Delete broadcast messages that are past their delete_at time."""
+    p = await get_pool()
+    async with p.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, chat_id, message_id FROM broadcast_msgs WHERE delete_at <= NOW()"
         )
-        logger.info("Admin command menu set.")
-    except TelegramError as e:
-        logger.warning(f"Admin commands not set (start bot as admin first): {e}")
+        for row in rows:
+            try:
+                await bot.delete_message(row["chat_id"], row["message_id"])
+            except Exception:
+                pass
+        if rows:
+            ids = [r["id"] for r in rows]
+            await conn.execute("DELETE FROM broadcast_msgs WHERE id=ANY($1)", ids)
 
 
-# ─────────────────────────── MAIN ───────────────────────────────────────────
+async def refresh_video_cache():
+    global _video_cache, _cache_time
+    _video_cache = await get_channel_videos()
+    _cache_time  = datetime.now(timezone.utc)
+    log.info(f"Video cache refreshed: {len(_video_cache)} videos")
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set!")
+# ── Main ──────────────────────────────────────────────────────────────────────
+async def main():
+    await init_db()
+    log.info("Database initialized.")
 
-    init_db()
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(delete_expired_broadcasts, "interval", minutes=10)
+    scheduler.add_job(refresh_video_cache,        "interval", minutes=5)
+    scheduler.start()
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(setup_commands)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start",     start_handler))
-    app.add_handler(CommandHandler("help",      help_handler))
-    app.add_handler(CommandHandler("status",    status_handler))
-    app.add_handler(CommandHandler("users",     users_handler))
-    app.add_handler(CommandHandler("broadcast", broadcast_handler))
-    app.add_handler(CommandHandler("settimer",  settimer_handler))
-    app.add_handler(CommandHandler("setchannel", setchannel_handler))
-
-    # Nav callbacks: prev/next AND random button
-    app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^nav_(next|prev)_\d+$"))
-    app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^nav_random$"))
-
-    app.add_handler(MessageHandler(
-        filters.UpdateType.CHANNEL_POST & (filters.VIDEO | filters.Document.VIDEO),
-        channel_post_handler,
-    ))
-
-    app.job_queue.run_repeating(check_expiry_job, interval=300, first=60)
-
-    logger.info("Bot started (v3 — resume position, async VPLink, cached bot_me, clean UI).")
-    app.run_polling(
-        allowed_updates=[
-            Update.MESSAGE,
-            Update.CALLBACK_QUERY,
-            Update.CHANNEL_POST,   # ← private channel videos ke liye ZARURI
-        ],
-        drop_pending_updates=True,
-    )
+    log.info("Bot starting...")
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
