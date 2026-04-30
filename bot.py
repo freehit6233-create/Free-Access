@@ -439,6 +439,12 @@ async def nav_callback(call: CallbackQuery):
     new_free = free_used + 1 if not has_access else free_used
     await update_user(user_id, video_index=index, free_used=new_free)
 
+    # delete the previous video message
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
     await call.answer()
     await send_video_to_user(user_id, index, bot)
 
