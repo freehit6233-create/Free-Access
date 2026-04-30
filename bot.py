@@ -294,19 +294,42 @@ async def user_has_active_access(user: asyncpg.Record) -> bool:
 async def generate_vplink(user_id: int) -> str:
     """Call VPLink API to generate a short verification link."""
     callback_url = f"https://t.me/{BOT_USERNAME}?start=verify_{user_id}"
+
+    if not VPLINK_API:
+        return callback_url
+
     try:
+        # VPLINK_API format: https://vplink.in/api?api=YOUR_KEY&url=
+        # Just append the encoded callback URL directly
+        import urllib.parse
+        full_url = VPLINK_API + urllib.parse.quote(callback_url, safe="")
+
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"{VPLINK_API}/api",
-                params={"api": VPLINK_API.split("api=")[-1] if "api=" in VPLINK_API else "",
-                        "url": callback_url},
-                timeout=aiohttp.ClientTimeout(total=8)
+                full_url,
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
-                data = await resp.json()
-                return data.get("shortenedUrl") or data.get("short_url") or callback_url
+                text = await resp.text()
+                log.info(f"VPLink raw response: {text}")
+                try:
+                    data = await resp.json(content_type=None)
+                    short = (
+                        data.get("shortenedUrl")
+                        or data.get("short_url")
+                        or data.get("shortened_url")
+                        or data.get("shortLink")
+                        or data.get("link")
+                    )
+                    return short if short else callback_url
+                except Exception:
+                    # Some shorteners return plain URL as text
+                    text = text.strip()
+                    if text.startswith("http"):
+                        return text
+                    return callback_url
     except Exception as e:
         log.warning(f"VPLink error: {e}")
-        return callback_url  # fallback to direct link
+        return callback_url
 
 # ── Channel Post Handler ──────────────────────────────────────────────────────
 @router.channel_post(F.chat.id == PRIVATE_CHANNEL_ID)
