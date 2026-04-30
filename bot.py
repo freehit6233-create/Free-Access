@@ -87,6 +87,12 @@ async def init_db():
             message_id  BIGINT,
             delete_at   TIMESTAMPTZ
         );
+
+        CREATE TABLE IF NOT EXISTS videos (
+            id         SERIAL PRIMARY KEY,
+            message_id BIGINT UNIQUE NOT NULL,
+            added_at   TIMESTAMPTZ DEFAULT NOW()
+        );
         """)
         # seed default free_hours setting
         await conn.execute("""
@@ -165,6 +171,28 @@ async def all_user_ids() -> list[int]:
         return [r["user_id"] for r in rows]
 
 
+async def save_video(message_id: int):
+    p = await get_pool()
+    async with p.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO videos (message_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            message_id
+        )
+
+
+async def delete_video(message_id: int):
+    p = await get_pool()
+    async with p.acquire() as conn:
+        await conn.execute("DELETE FROM videos WHERE message_id=$1", message_id)
+
+
+async def get_all_video_ids() -> list[int]:
+    p = await get_pool()
+    async with p.acquire() as conn:
+        rows = await conn.fetch("SELECT message_id FROM videos ORDER BY added_at ASC")
+        return [r["message_id"] for r in rows]
+
+
 async def save_broadcast_msg(chat_id: int, message_id: int, delete_at: datetime):
     p = await get_pool()
     async with p.acquire() as conn:
@@ -181,16 +209,8 @@ dp.include_router(router)
 
 # ── Utility ───────────────────────────────────────────────────────────────────
 async def get_channel_videos() -> list[int]:
-    """Return list of message IDs that contain video in the private channel."""
-    msgs = []
-    try:
-        async for msg in bot.iter_messages(PRIVATE_CHANNEL_ID, limit=200):
-            if msg.video or msg.document:
-                msgs.append(msg.message_id)
-    except Exception:
-        # fallback: get latest 200 messages and filter
-        pass
-    return sorted(msgs)
+    """Return list of message IDs from DB (saved when videos were posted to channel)."""
+    return await get_all_video_ids()
 
 
 # cache videos to avoid repeated API calls
@@ -287,6 +307,29 @@ async def generate_vplink(user_id: int) -> str:
     except Exception as e:
         log.warning(f"VPLink error: {e}")
         return callback_url  # fallback to direct link
+
+# ── Channel Post Handler ──────────────────────────────────────────────────────
+@router.channel_post(F.chat.id == PRIVATE_CHANNEL_ID)
+async def on_channel_post(message: Message):
+    """Auto-save video/document message IDs from private channel to DB."""
+    if message.video or message.document:
+        await save_video(message.message_id)
+        # Invalidate cache so next request fetches fresh list
+        global _video_cache, _cache_time
+        _video_cache = []
+        _cache_time  = None
+        log.info(f"New video saved from channel: message_id={message.message_id}")
+
+
+@router.edited_channel_post(F.chat.id == PRIVATE_CHANNEL_ID)
+async def on_channel_post_deleted(message: Message):
+    """Handle edited posts — if video removed, clean up."""
+    if not message.video and not message.document:
+        await delete_video(message.message_id)
+        global _video_cache, _cache_time
+        _video_cache = []
+        _cache_time  = None
+
 
 # ── /start ────────────────────────────────────────────────────────────────────
 @router.message(CommandStart())
@@ -557,7 +600,7 @@ async def main():
     scheduler.start()
 
     log.info("Bot starting...")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post", "edited_channel_post"])
 
 
 if __name__ == "__main__":
