@@ -351,16 +351,12 @@ async def cmd_start(message: Message):
     db_user = await get_user(user.id)
     db_user = await check_and_reset_free(db_user)
 
-    # delete any old 'Get Link' / start messages (send fresh)
     welcome = (
         f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
-        f"🎬 You have <b>{FREE_VIDEO_LIMIT - db_user['free_used']}</b> free videos remaining.\n"
-        f"Tap below to start watching!"
+        f"🎬 You have <b>{FREE_VIDEO_LIMIT - db_user['free_used']}</b> free videos remaining."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Watch Videos", callback_data=f"nav:{db_user['video_index']}")]
-    ])
-    await message.answer(welcome, reply_markup=kb)
+    await message.answer(welcome)
+    await send_video_to_user(user.id, db_user['video_index'], bot)
 
 
 async def handle_verification(message: Message, user_id: int):
