@@ -64,7 +64,10 @@ def get_pool() -> psycopg_pool.ConnectionPool:
             conninfo=DATABASE_URL,
             min_size=2,
             max_size=10,
-            kwargs={"row_factory": dict_row},
+            kwargs={
+                "row_factory": dict_row,
+                "autocommit": True,   # ← FIX: har write auto-commit hogi
+            },
             open=True,
         )
     return _pool
@@ -120,7 +123,8 @@ def init_db():
     """
     try:
         with get_db() as conn:
-            conn.execute(ddl)
+            with conn.cursor() as cur:
+                cur.execute(ddl)
         logger.info("Database initialised.")
     except Exception as e:
         logger.error(f"DB init error: {e}")
@@ -240,10 +244,11 @@ def db_get_random_video_file_id() -> str | None:
 def db_save_video(file_id: str):
     try:
         with get_db() as conn:
-            conn.execute("""
-                INSERT INTO videos (file_id) VALUES (%s)
-                ON CONFLICT (file_id) DO NOTHING
-            """, (file_id,))
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO videos (file_id) VALUES (%s)
+                    ON CONFLICT (file_id) DO NOTHING
+                """, (file_id,))
         logger.info(f"Video saved: {file_id[:25]}...")
     except Exception as e:
         logger.error(f"db_save_video: {e}")
