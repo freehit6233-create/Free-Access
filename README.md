@@ -1,175 +1,190 @@
-# XVIP Telegram Video Manager Bot
+# 🎬 VVIP Video Telegram Bot
 
-Advanced Telegram bot with VPLink verification, Neon PostgreSQL, daily free limits, and auto-delete.
+A high-performance Telegram video management bot with free-limit logic, VPLink verification, admin panel, and auto-delete — built with **aiogram 3**, **asyncpg**, and **Neon PostgreSQL**.
 
 ---
 
-## Features
+## ✨ Features
 
 | Feature | Details |
 |---|---|
-| Auto video fetch | Watches SOURCE_CHANNEL, saves file_id to DB |
-| protect_content | All videos — no download, no forward |
-| Auto-delete | Videos deleted 10 minutes after sending |
-| Daily free limit | 3 videos/day per user |
-| VPLink integration | Generates verified short links for access |
-| 3-hour access | After verification, unlimited videos for 3 hours |
-| 2% repeat | Random repeat of older videos |
-| Pagination | Previous / Next buttons, edits message in place |
-| Admin commands | /status, /broadcast, /settimer |
-| Expiry notification | User notified when 3-hour access expires |
+| 🎥 Video Navigation | One video at a time with Prev/Next buttons |
+| 🔒 Free Limit | 3 free videos per 24 hours |
+| 🔗 VPLink Verification | Get N-hour free access via link verify |
+| ⏰ Auto-Delete | Videos delete after 10 min |
+| 📢 Broadcast | Admin broadcast with 12h auto-delete |
+| 📊 Status | Channel video count + 24h verifications |
+| ⏱ Set Timer | Admin can change free hours dynamically |
+| 🛡 protect_content | Prevent forwarding/saving of videos |
 
 ---
 
-## File Structure
+## 🚀 Setup
 
-```
-.
-├── bot.py            ← Main bot (all logic)
-├── requirements.txt  ← Python dependencies
-└── README.md         ← This file
-```
-
----
-
-## Environment Variables
-
-Set these in Railway (or .env locally):
-
-| Variable | Description | Example |
-|---|---|---|
-| `BOT_TOKEN` | Your BotFather token | `123456:ABC-DEF...` |
-| `ADMIN_ID` | Your Telegram numeric user ID | `987654321` |
-| `SOURCE_CHANNEL_ID` | Private channel ID (negative number) | `-1001234567890` |
-| `DATABASE_URL` | Neon PostgreSQL connection string | `postgresql://user:pass@host/db` |
-| `VPLINK_API_KEY` | Your VPLink API key | `abc123xyz` |
-
----
-
-## Local Setup
-
+### 1. Clone the repo
 ```bash
-# 1. Clone the repo
-git clone https://github.com/your-username/your-bot-repo.git
-cd your-bot-repo
+git clone https://github.com/YOUR_USERNAME/VVIP-VDO-TELE-BOT.git
+cd VVIP-VDO-TELE-BOT
+```
 
-# 2. Create virtual environment
-python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-
-# 3. Install dependencies
+### 2. Install dependencies
+```bash
 pip install -r requirements.txt
-
-# 4. Set environment variables
-export BOT_TOKEN="your_token"
-export ADMIN_ID="your_id"
-export SOURCE_CHANNEL_ID="-1001234567890"
-export DATABASE_URL="postgresql://..."
-export VPLINK_API_KEY="your_vplink_key"
-
-# 5. Run
-python bot.py
 ```
 
----
-
-## Railway Deployment
-
-### Step 1 — Push code to GitHub
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
+### 3. Create `.env` file
+```env
+BOT_TOKEN=your_bot_token_here
+ADMIN_ID=your_telegram_user_id
+PRIVATE_CHANNEL_ID=-100xxxxxxxxxx
+DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require
+VPLINK_API=https://vplink.in/api?api=YOUR_API_KEY&url=
+BOT_USERNAME=your_bot_username
 ```
 
-### Step 2 — Create Railway project
-1. Go to [railway.app](https://railway.app) → New Project
-2. Select **Deploy from GitHub repo**
-3. Choose your repository
+### 4. Get your credentials
 
-### Step 3 — Add environment variables
-In Railway dashboard → your service → **Variables** tab, add all 5 variables from the table above.
-
-### Step 4 — Set start command
-In **Settings** → **Deploy** → **Start Command**:
+#### BotFather
+1. Open [@BotFather](https://t.me/BotFather) on Telegram
+2. `/newbot` → get your `BOT_TOKEN`
+3. Set commands:
 ```
-python bot.py
+start - Start watching videos
+help - Show help
+status - Admin: Bot status
+settimer - Admin: Set free hours
+broadcast - Admin: Broadcast message
+ban - Admin: Ban user
+unban - Admin: Unban user
 ```
 
-### Step 5 — Deploy
-Railway will auto-deploy on every `git push` to `main`.
+#### Private Channel
+1. Create a private channel
+2. Add your bot as **admin** with permission to read messages
+3. Get the channel ID (starts with `-100...`)
 
----
-
-## Neon PostgreSQL Setup
-
+#### Neon PostgreSQL
 1. Go to [neon.tech](https://neon.tech) → Create project
-2. Copy the **Connection string** (it looks like `postgresql://user:pass@host.neon.tech/neondb?sslmode=require`)
-3. Set it as `DATABASE_URL` in Railway
+2. Copy the **Connection string** → set as `DATABASE_URL`
 
-The bot creates all tables automatically on first run:
-- `videos` — stores file_id of each video
-- `users` — tracks daily count, access expiry, current index
-- `verifications` — one-time tokens for VPLink verification
-- `settings` — configurable values (access_hours)
+#### VPLink API
+1. Go to [vplink.in](https://vplink.in) → Register → Get API key
+2. `VPLINK_API=https://vplink.in/api?api=YOUR_KEY&url=`
 
 ---
 
-## How the Verification Flow Works
+## 🚂 Railway Deployment
 
-```
-User clicks "Next" after 3 free videos
-        ↓
-Bot calls VPLink API → generates short URL wrapping
-    t.me/YourBot?start=verify_USERID_TOKEN
-        ↓
-User opens short URL → VPLink interstitial page
-        ↓
-User clicks "Continue" on VPLink page
-        ↓
-Telegram opens: t.me/YourBot?start=verify_USERID_TOKEN
-        ↓
-Bot validates token (30-min window, single use)
-        ↓
-✅ Access granted for 3 hours (configurable)
+### Method 1: GitHub (Recommended)
+1. Push code to GitHub
+2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
+3. Select your repo
+4. Add all environment variables from `.env` in Railway's **Variables** tab
+5. Railway auto-deploys on every push ✅
+
+### Method 2: Railway CLI
+```bash
+npm i -g @railway/cli
+railway login
+railway init
+railway up
 ```
 
 ---
 
-## Admin Commands
+## 🖥️ AWS EC2 Deployment (Alternative)
 
-| Command | Who | Description |
-|---|---|---|
-| `/start` | Everyone | Start bot, shows first video |
-| `/status` | Admin only | Verifications (24h), total videos, timer |
-| `/broadcast` | Admin only | Reply to any message → sends to all users |
-| `/settimer 6` | Admin only | Change access duration to 6 hours |
+```bash
+# On EC2 instance
+git clone https://github.com/YOUR_USERNAME/VVIP-VDO-TELE-BOT.git
+cd VVIP-VDO-TELE-BOT
+pip install -r requirements.txt
+cp .env.example .env   # fill in your values
 
-### Broadcast usage
-1. Send or forward the image/text you want to broadcast
-2. Reply to it with `/broadcast`
-3. Bot sends it to all registered users
+# systemd service
+sudo nano /etc/systemd/system/vvipbot.service
+```
 
----
+```ini
+[Unit]
+Description=VVIP Video Bot
+After=network.target
 
-## Configuration (in bot.py)
+[Service]
+WorkingDirectory=/home/ubuntu/VVIP-VDO-TELE-BOT
+ExecStart=/usr/bin/python3 bot.py
+EnvironmentFile=/home/ubuntu/VVIP-VDO-TELE-BOT/.env
+Restart=always
+RestartSec=5
 
-```python
-FREE_VIDEOS_PER_DAY  = 3      # daily free limit
-DEFAULT_ACCESS_HOURS = 3      # hours of verified access
-VIDEO_DELETE_MINUTES = 10     # auto-delete timer
-REPEAT_CHANCE        = 0.02   # 2% random repeat chance
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable vvipbot
+sudo systemctl start vvipbot
+sudo journalctl -u vvipbot -f   # logs
 ```
 
 ---
 
-## Source Channel Setup
+## 📁 Project Structure
 
-1. Create a **private Telegram channel**
-2. Add your bot as an **Administrator** with "Post Messages" permission
-3. Get the channel ID (use [@userinfobot](https://t.me/userinfobot) or forward a message to a bot that shows IDs)
-4. Set it as `SOURCE_CHANNEL_ID` (will be a negative number like `-1001234567890`)
+```
+VVIP-VDO-TELE-BOT/
+├── bot.py            # Main bot code
+├── requirements.txt  # Python dependencies
+├── .env              # Environment variables (gitignored)
+├── .env.example      # Template
+├── .gitignore
+└── README.md
+```
 
-Any video posted to this channel will be automatically saved to the database.
+---
+
+## 🔧 Admin Commands
+
+| Command | Usage |
+|---|---|
+| `/status` | Show videos count + verifications |
+| `/settimer 6` | Set free access to 6 hours |
+| `/broadcast` | Reply to a message to broadcast it |
+| `/ban <user_id>` | Ban a user |
+| `/unban <user_id>` | Unban a user |
+
+---
+
+## 🗄️ Database Schema
+
+```sql
+users          -- User state, free_used, access_until, video_index
+settings       -- Key-value config (free_hours, etc.)
+verifications  -- Log of all link verifications
+broadcast_msgs -- Track broadcast messages for auto-delete
+```
+
+---
+
+## 🔄 Update Workflow (EC2)
+
+```bash
+git pull origin main
+sudo systemctl restart vvipbot
+```
+
+---
+
+## ⚠️ Notes
+
+- Bot must be **admin** in the private channel to copy videos
+- `protect_content=True` prevents users from forwarding/saving videos
+- VPLink callback uses `https://t.me/{BOT_USERNAME}?start=verify_{user_id}` format
+- Videos are cached for 5 minutes to reduce API calls
+
+---
+
+## 📄 License
+
+MIT — Use freely, modify as needed.
