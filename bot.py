@@ -64,10 +64,7 @@ def get_pool() -> psycopg_pool.ConnectionPool:
             conninfo=DATABASE_URL,
             min_size=2,
             max_size=10,
-            kwargs={
-                "row_factory": dict_row,
-                "autocommit": True,   # ← FIX: har write auto-commit hogi
-            },
+            kwargs={"autocommit": True},   # dict_row per-cursor set hoti hai
             open=True,
         )
     return _pool
@@ -205,39 +202,44 @@ def db_set_random_mode(user_id: int, enabled: bool):
 def db_get_video_count() -> int:
     try:
         with get_db() as conn:
+            # Use default tuple cursor (not dict_row) so row[0] works
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM videos")
                 row = cur.fetchone()
-                return row[0] if row else 0
+                count = row[0] if row else 0
+                logger.info(f"db_get_video_count: {count}")
+                return count
     except Exception as e:
-        logger.error(f"db_get_video_count: {e}")
+        logger.error(f"db_get_video_count error: {e}")
         return 0
 
 
 def db_get_video_at_index(index: int) -> str | None:
     try:
         with get_db() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor() as cur:   # tuple cursor — row[0] = file_id
                 cur.execute(
                     "SELECT file_id FROM videos ORDER BY id LIMIT 1 OFFSET %s",
                     (index,)
                 )
                 row = cur.fetchone()
-        return row[0] if row else None
+                file_id = row[0] if row else None
+                logger.info(f"db_get_video_at_index({index}): {file_id[:20] if file_id else None}")
+                return file_id
     except Exception as e:
-        logger.error(f"db_get_video_at_index: {e}")
+        logger.error(f"db_get_video_at_index error: {e}")
         return None
 
 
 def db_get_random_video_file_id() -> str | None:
     try:
         with get_db() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor() as cur:   # tuple cursor
                 cur.execute("SELECT file_id FROM videos ORDER BY RANDOM() LIMIT 1")
                 row = cur.fetchone()
-        return row[0] if row else None
+                return row[0] if row else None
     except Exception as e:
-        logger.error(f"db_get_random_video: {e}")
+        logger.error(f"db_get_random_video error: {e}")
         return None
 
 
