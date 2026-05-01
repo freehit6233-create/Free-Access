@@ -678,13 +678,17 @@ async def callback_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_update_user(user_id, videos_watched=watched + 1)
         user = db_get_user(user_id)
 
-    # Random mode after all videos seen
+    total = len(videos)
     seen_all = user.get("seen_all") or False
-    if not seen_all and requested_index >= len(videos):
+    last_index = user.get("last_index") or 0
+
+    # Jab Next dabane par loop complete ho (last video se index 0 par aaye)
+    if not seen_all and last_index == total - 1 and requested_index == 0:
         db_update_user(user_id, seen_all=True)
         seen_all = True
+
     if seen_all:
-        requested_index = random.randint(0, len(videos) - 1)
+        requested_index = random.randint(0, total - 1)
 
     await send_video_to_user(context, user_id, requested_index, videos)
 
@@ -697,9 +701,51 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     message = update.channel_post
     if not message or message.chat.id != CHANNEL_ID:
         return
-    if message.video:
-        db_save_video(message.video.file_id, message.message_id)
-        logger.info(f"Video saved from channel: {message.video.file_id}")
+    if not message.video:
+        return
+
+    db_save_video(message.video.file_id, message.message_id)
+    logger.info(f"New video saved from channel: {message.video.file_id}")
+
+    # Sabhi active users ko naya video turant bhejo
+    videos = db_get_videos()
+    new_index = len(videos) - 1  # Latest video
+    now = datetime.now(timezone.utc)
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id FROM users WHERE access_until IS NOT NULL AND access_until > %s",
+            (now,),
+        )
+        active_users = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    sent_count = 0
+    for uid in active_users:
+        try:
+            await send_video_to_user(context, uid, new_index, videos)
+            await context.bot.send_message(
+                chat_id=uid,
+                text="🆕 *Naya video aa gaya!* Enjoy karo 🎬",
+                parse_mode="Markdown",
+            )
+            sent_count += 1
+        except TelegramError as e:
+            logger.warning(f"New video notify uid={uid}: {e}")
+
+    # seen_all reset karo — naya content hai ab
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET seen_all = FALSE WHERE seen_all = TRUE")
+        conn.commit()
+    finally:
+        conn.close()
+
+    logger.info(f"New video pushed to {sent_count} active user(s).")
 
 
 # ─────────────────────────────────────────────
