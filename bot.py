@@ -374,9 +374,29 @@ async def cmd_start(message: Message):
     db_user = await get_user(user.id)
     db_user = await check_and_reset_free(db_user)
 
+    has_access = await user_has_active_access(db_user)
+    free_used  = db_user["free_used"]
+
+    # limit reached — show Get Link button instead of video
+    if not has_access and free_used >= FREE_VIDEO_LIMIT:
+        free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
+        link = await generate_vplink(user.id)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Get Link", url=link)]
+        ])
+        await message.answer(
+            f"👋 <b>Welcome back, {user.first_name}!</b>\n\n"
+            f"🔒 <b>Verify This Link Get {free_hours} Hour Access</b>\n\n"
+            f"Aapne apne {FREE_VIDEO_LIMIT} free videos dekh liye.\n"
+            f"Neeche diye link ko verify karo aur <b>{free_hours} ghante</b> ka free access pao! ✅",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        return
+
     welcome = (
         f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
-        f"🎬 You have <b>{FREE_VIDEO_LIMIT - db_user['free_used']}</b> free videos remaining."
+        f"🎬 You have <b>{FREE_VIDEO_LIMIT - free_used}</b> free videos remaining."
     )
     await message.answer(welcome)
     await send_video_to_user(user.id, db_user['video_index'], bot)
@@ -387,13 +407,22 @@ async def handle_verification(message: Message, user_id: int):
     free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
     access_until = datetime.now(timezone.utc) + timedelta(hours=free_hours)
 
+    # Set access_until in DB — this is the gate
     await update_user(user_id, access_until=access_until)
     await log_verification(user_id)
 
+    # Verify it actually saved
+    db_user = await get_user(user_id)
+    if not await user_has_active_access(db_user):
+        await message.answer("❌ Verification failed. Please try again.")
+        return
+
     name = message.from_user.full_name
-    conf = await message.answer(
-        f"✅ <b>Hello {name}, your {free_hours} hour access is active!</b>\n"
-        f"⏰ Access expires at: <code>{access_until.strftime('%H:%M UTC')}</code>"
+    await message.answer(
+        f"✅ <b>Verified! {free_hours} hour access active hai, {name}!</b>\n"
+        f"⏰ Access expires: <code>{access_until.strftime('%H:%M UTC')}</code>\n\n"
+        f"🎬 Enjoy watching!",
+        parse_mode="HTML"
     )
 
     # notify admin
@@ -408,7 +437,7 @@ async def handle_verification(message: Message, user_id: int):
     except Exception:
         pass
 
-    # send next video immediately
+    # send video immediately after verification
     await asyncio.sleep(1)
     await send_video_to_user(user_id, db_user["video_index"], bot)
 
@@ -447,13 +476,21 @@ async def nav_callback(call: CallbackQuery):
     if not has_access and free_used >= FREE_VIDEO_LIMIT:
         free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
         link = await generate_vplink(user_id)
-        kb   = InlineKeyboardMarkup(inline_keyboard=[
+        kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Get Link", url=link)]
         ])
-        await call.message.answer(
-            f"🔒 <b>Free limit reached!</b>\n\n"
-            f"Verify this link to get free access for <b>{free_hours} hours</b>:",
-            reply_markup=kb
+        # delete old video message first
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        await bot.send_message(
+            user_id,
+            f"🔒 <b>Verify This Link Get {free_hours} Hour Access</b>\n\n"
+            f"Aapne apne {FREE_VIDEO_LIMIT} free videos dekh liye.\n"
+            f"Neeche diye link ko verify karo aur <b>{free_hours} ghante</b> ka free access pao! ✅",
+            reply_markup=kb,
+            parse_mode="HTML"
         )
         await call.answer()
         return
