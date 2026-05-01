@@ -419,6 +419,7 @@ async def send_video_to_user(
     user_id: int,
     index: int,
     videos: list,
+    seen_all: bool = False,
 ):
     total = len(videos)
     if total == 0:
@@ -429,10 +430,17 @@ async def send_video_to_user(
     video = videos[index]
     buttons = []
     if total > 1:
-        buttons.append([
-            InlineKeyboardButton("⬅️ Prev", callback_data=f"nav_{(index - 1) % total}"),
-            InlineKeyboardButton("Next ➡️", callback_data=f"nav_{(index + 1) % total}"),
-        ])
+        if seen_all:
+            # Random mode — dono buttons random next video dikhayenge
+            buttons.append([
+                InlineKeyboardButton("⬅️ Prev", callback_data="nav_random"),
+                InlineKeyboardButton("Next ➡️", callback_data="nav_random"),
+            ])
+        else:
+            buttons.append([
+                InlineKeyboardButton("⬅️ Prev", callback_data=f"nav_{(index - 1) % total}"),
+                InlineKeyboardButton("Next ➡️", callback_data=f"nav_{(index + 1) % total}"),
+            ])
 
     # Pichla video delete karo
     user = db_get_user(user_id)
@@ -452,7 +460,6 @@ async def send_video_to_user(
         )
     except TelegramError as e:
         logger.error(f"send_video error for uid={user_id} index={index}: {e}")
-        # file_id stale ho sakta hai — DB se hata do aur skip karo
         conn = get_conn()
         try:
             cur = conn.cursor()
@@ -671,11 +678,6 @@ async def callback_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ Koi video nahi mili.")
         return
 
-    try:
-        requested_index = int(query.data.split("_")[1])
-    except (IndexError, ValueError):
-        return
-
     watched = user.get("videos_watched") or 0
 
     if not has_valid_access(user):
@@ -685,19 +687,31 @@ async def callback_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_update_user(user_id, videos_watched=watched + 1)
         user = db_get_user(user_id)
 
-    total = len(videos)
-    seen_all = user.get("seen_all") or False
+    total      = len(videos)
+    seen_all   = user.get("seen_all") or False
     last_index = user.get("last_index") or 0
 
-    # Jab Next dabane par loop complete ho (last video se index 0 par aaye)
-    if not seen_all and last_index == total - 1 and requested_index == 0:
-        db_update_user(user_id, seen_all=True)
-        seen_all = True
-
-    if seen_all:
+    if query.data == "nav_random" or seen_all:
+        # Random mode
+        if not seen_all:
+            db_update_user(user_id, seen_all=True)
         requested_index = random.randint(0, total - 1)
+        await send_video_to_user(context, user_id, requested_index, videos, seen_all=True)
+        return
 
-    await send_video_to_user(context, user_id, requested_index, videos)
+    try:
+        requested_index = int(query.data.split("_")[1])
+    except (IndexError, ValueError):
+        return
+
+    # Loop complete check — last video se Next dabake index 0 aaya
+    if last_index == total - 1 and requested_index == 0:
+        db_update_user(user_id, seen_all=True)
+        requested_index = random.randint(0, total - 1)
+        await send_video_to_user(context, user_id, requested_index, videos, seen_all=True)
+        return
+
+    await send_video_to_user(context, user_id, requested_index, videos, seen_all=False)
 
 
 # ─────────────────────────────────────────────
@@ -849,7 +863,7 @@ def main():
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("reset",     cmd_reset))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CallbackQueryHandler(callback_nav, pattern=r"^nav_\d+$"))
+    app.add_handler(CallbackQueryHandler(callback_nav, pattern=r"^nav_(\d+|random)$"))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post_handler))
 
     async def post_init(application):
