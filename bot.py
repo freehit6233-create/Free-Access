@@ -727,11 +727,6 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     for uid in active_users:
         try:
             await send_video_to_user(context, uid, new_index, videos)
-            await context.bot.send_message(
-                chat_id=uid,
-                text="🆕 *Naya video aa gaya!* Enjoy karo 🎬",
-                parse_mode="Markdown",
-            )
             sent_count += 1
         except TelegramError as e:
             logger.warning(f"New video notify uid={uid}: {e}")
