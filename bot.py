@@ -408,22 +408,21 @@ async def send_video_to_user(
     buttons = []
     if total > 1:
         buttons.append([
-            InlineKeyboardButton("⬅️ Previous", callback_data=f"nav_{(index - 1) % total}"),
-            InlineKeyboardButton("Next ➡️",     callback_data=f"nav_{(index + 1) % total}"),
+            InlineKeyboardButton("⬅️ Prev", callback_data=f"nav_{(index - 1) % total}"),
+            InlineKeyboardButton("Next ➡️", callback_data=f"nav_{(index + 1) % total}"),
         ])
 
     try:
         await context.bot.send_video(
             chat_id=user_id,
             video=video["file_id"],
-            caption=f"🎬 Video {index + 1} / {total}",
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
             protect_content=True,
         )
         db_update_user(user_id, last_index=index)
     except TelegramError as e:
         logger.error(f"send_video error: {e}")
-        await context.bot.send_message(user_id, "❌ Video load nahi ho saki. Dobara try karein.")
+        await context.bot.send_message(user_id, "❌ Video load nahi hui। Dobara try karo।")
 
 
 async def send_verification_message(context: ContextTypes.DEFAULT_TYPE, user_id: int):
@@ -432,13 +431,13 @@ async def send_verification_message(context: ContextTypes.DEFAULT_TYPE, user_id:
     vp_url = await build_vp_link(token)
 
     text = (
-        "🔒 *Free limit khatam ho gayi!*\n\n"
-        "✅ Neeche diye link ko verify karo aur *3 ghante ki free access* pao.\n\n"
+        "🔒 *Free limit khatam!*\n\n"
+        "Neeche diye link pe verify karo aur *3 ghante ki access* pao।\n\n"
         "📌 *Steps:*\n"
-        "1️⃣ 'Get Link' button dabao\n"
-        "2️⃣ Jo page khule uspe ad close karke wait karo\n"
+        "1️⃣ *Get Link* dabao\n"
+        "2️⃣ Page pe ad band karo aur thoda wait karo\n"
         "3️⃣ Verify hone ke baad wapas bot pe aao\n\n"
-        "⏳ Access milne ke baad *3 ghante* valid rahega."
+        "⏳ Access *3 ghante* valid rahegi।"
     )
     await context.bot.send_message(
         chat_id=user_id,
@@ -482,20 +481,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             db_log_verification(user_id)
             await update.message.reply_text(
-                f"✅ *Verification successful!*\n\n"
-                f"🎉 Tumhare paas *{ACCESS_HOURS} ghante* ki free access hai. Videos enjoy karo! 🎬",
+                f"✅ *Verified!*\n\n"
+                f"🎉 *{ACCESS_HOURS} ghante* ki access mil gayi — enjoy karo! 🎬",
                 parse_mode="Markdown",
             )
             user = db_get_user(user_id)
             await send_video_to_user(context, user_id, user.get("last_index", 0), videos)
         else:
-            await update.message.reply_text("❌ Link invalid ya expired. Dobara /start karo.")
+            await update.message.reply_text("❌ Link invalid ya expire ho gaya। Dobara /start karo।")
         return
 
     # Normal start
     if not videos:
         await update.message.reply_text(
-            "👋 *Bot mein aapka swagat hai!*\n\nAbhi koi video nahi hai. Jaldi aayengi! 🎬",
+            "👋 *Swagat hai!*\n\nAbhi koi video available nahi hai. Jaldi aayengi! 🎬",
             parse_mode="Markdown",
         )
         return
@@ -509,16 +508,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ℹ️ *Bot Usage Guide — @RNDAccess\\_bot*\n\n"
-        "▶️ /start — Bot shuru karo\n"
+        "📖 *Help — @RNDAccess\\_bot*\n\n"
+        "▶️ /start — Videos dekhna shuru karo\n"
         "❓ /help  — Yeh guide\n\n"
-        "📌 *Features:*\n"
-        "• Pehli *3 videos* bilkul free\n"
-        "• Uske baad VP link verify karo → *3 ghante ki access*\n"
-        "• ⬅️ Previous / Next ➡️ se navigate karo\n"
-        "• Videos forward ya download nahi ho sakti *(protected)*\n"
-        "• Saari videos dekh lo to random videos chalti hain\n\n"
-        "🔒 Access expire hone par dobara verify karna hoga.",
+        "🎬 *Kaise kaam karta hai:*\n"
+        "• Pehli *3 videos* free hain\n"
+        "• Free limit ke baad ek link verify karo\n"
+        "• Verify hone par *3 ghante* ki full access milti hai\n"
+        "• ⬅️ Prev / Next ➡️ se navigate karo\n\n"
+        "🔒 Access expire hone par dobara verify karo.",
         parse_mode="Markdown",
     )
 
@@ -528,8 +526,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"📊 *Bot Status*\n\n"
-        f"✅ Last 24h verifications: *{db_verifications_24h()}*\n"
-        f"🎬 Total videos in DB: *{db_video_count()}*",
+        f"✅ Verifications (24h): *{db_verifications_24h()}*\n"
+        f"🎬 Total videos: *{db_video_count()}*",
         parse_mode="Markdown",
     )
 
@@ -538,7 +536,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     db_reset_all_access()
-    await update.message.reply_text("♻️ Sabhi users ka access reset ho gaya. Sabko fir verify karna hoga.")
+    await update.message.reply_text("♻️ Sabhi users ka access reset ho gaya।")
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -580,8 +578,8 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 fail += 1
 
     await message.reply_text(
-        f"📢 *Broadcast bheja!*\n✅ Sent: *{sent}*\n❌ Failed: *{fail}*\n"
-        f"🗑️ Auto-delete: *{BROADCAST_HOURS} ghante baad*",
+        f"📢 *Broadcast Done!*\n✅ Sent: *{sent}*\n❌ Failed: *{fail}*\n"
+        f"🗑️ Auto-delete: *{BROADCAST_HOURS}h baad*",
         parse_mode="Markdown",
     )
 
