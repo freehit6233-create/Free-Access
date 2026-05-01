@@ -135,14 +135,22 @@ def init_db():
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id        BIGINT PRIMARY KEY,
-                videos_watched INT DEFAULT 0,
-                access_until   TIMESTAMPTZ,
-                verify_token   TEXT,
-                token_created  TIMESTAMPTZ,
-                last_index     INT DEFAULT 0,
-                seen_all       BOOLEAN DEFAULT FALSE
+                user_id             BIGINT PRIMARY KEY,
+                videos_watched      INT DEFAULT 0,
+                access_until        TIMESTAMPTZ,
+                verify_token        TEXT,
+                token_created       TIMESTAMPTZ,
+                last_index          INT DEFAULT 0,
+                seen_all            BOOLEAN DEFAULT FALSE,
+                last_video_msg_id   BIGINT,
+                last_video_sent_at  TIMESTAMPTZ
             )
+        """)
+        # Existing DB mein columns add karo agar nahi hain
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_video_msg_id  BIGINT,
+            ADD COLUMN IF NOT EXISTS last_video_sent_at TIMESTAMPTZ
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS verifications (
@@ -388,6 +396,18 @@ def has_valid_access(user: dict) -> bool:
     return now < access_until
 
 
+async def delete_last_video(context: ContextTypes.DEFAULT_TYPE, user: dict):
+    """User ka pichla video message delete karo agar hai to."""
+    msg_id = user.get("last_video_msg_id") if user else None
+    if not msg_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=user["user_id"], message_id=msg_id)
+    except TelegramError:
+        pass  # Already deleted ya unavailable — ignore
+    db_update_user(user["user_id"], last_video_msg_id=None, last_video_sent_at=None)
+
+
 # ─────────────────────────────────────────────
 # VIDEO SENDING
 # ─────────────────────────────────────────────
@@ -412,14 +432,23 @@ async def send_video_to_user(
             InlineKeyboardButton("Next ➡️", callback_data=f"nav_{(index + 1) % total}"),
         ])
 
+    # Pichla video delete karo
+    user = db_get_user(user_id)
+    await delete_last_video(context, user)
+
     try:
-        await context.bot.send_video(
+        sent = await context.bot.send_video(
             chat_id=user_id,
             video=video["file_id"],
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
             protect_content=True,
         )
-        db_update_user(user_id, last_index=index)
+        db_update_user(
+            user_id,
+            last_index=index,
+            last_video_msg_id=sent.message_id,
+            last_video_sent_at=datetime.now(timezone.utc),
+        )
     except TelegramError as e:
         logger.error(f"send_video error: {e}")
         await context.bot.send_message(user_id, "❌ Video load nahi hui। Dobara try karo।")
@@ -455,6 +484,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db_upsert_user(user_id)
     user   = db_get_user(user_id)
+
+    # Pichla video/messages delete karo
+    await delete_last_video(context, user)
     videos = db_get_videos()
     args   = context.args
 
@@ -507,6 +539,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = db_get_user(user_id)
+    await delete_last_video(context, user)
     await update.message.reply_text(
         "📖 *Help — @RNDAccess\\_bot*\n\n"
         "▶️ /start — Videos dekhna shuru karo\n"
@@ -655,6 +690,32 @@ async def job_delete_broadcasts(app):
         logger.info(f"Deleted {len(due)} expired broadcast(s).")
 
 
+async def job_auto_delete_videos(app):
+    """10 min se purane video messages auto-delete karo."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, last_video_msg_id FROM users "
+            "WHERE last_video_msg_id IS NOT NULL AND last_video_sent_at <= %s",
+            (cutoff,),
+        )
+        rows = _as_dicts(cur)
+    finally:
+        conn.close()
+
+    for row in rows:
+        try:
+            await app.bot.delete_message(chat_id=row["user_id"], message_id=row["last_video_msg_id"])
+        except TelegramError:
+            pass
+        db_update_user(row["user_id"], last_video_msg_id=None, last_video_sent_at=None)
+
+    if rows:
+        logger.info(f"Auto-deleted {len(rows)} expired video(s).")
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -672,7 +733,8 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post_handler))
 
     scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(job_delete_broadcasts, "interval", minutes=10, args=[app])
+    scheduler.add_job(job_delete_broadcasts,   "interval", minutes=10, args=[app])
+    scheduler.add_job(job_auto_delete_videos,  "interval", minutes=2,  args=[app])
     scheduler.start()
 
     logger.info(f"@{BOT_USERNAME} starting...")
