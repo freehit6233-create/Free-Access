@@ -80,25 +80,51 @@ def get_conn():
     )
 
 
+def _col_name(d) -> str:
+    """pg8000 column names kabhi kabhi bytes hote hain — safely decode karo."""
+    name = d[0]
+    return name.decode() if isinstance(name, bytes) else str(name)
+
+
 def _as_dicts(cursor) -> list:
     if not cursor.description:
         return []
-    cols = [d[0] for d in cursor.description]
+    cols = [_col_name(d) for d in cursor.description]
     return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 
 def _as_dict(cursor) -> dict | None:
     if not cursor.description:
         return None
-    cols = [d[0] for d in cursor.description]
+    cols = [_col_name(d) for d in cursor.description]
     row  = cursor.fetchone()
     return dict(zip(cols, row)) if row else None
 
 
 def init_db():
+    """
+    Tables create karo. pg8000 ke saath column names lowercase
+    quoted identifiers se define karte hain taaki case-sensitivity issue na ho.
+    Agar purani broken table hai (psycopg2 se), usse DROP karke recreate karo.
+    """
     conn = get_conn()
     try:
         cur = conn.cursor()
+
+        # Check karo videos table mein file_id column hai ya nahi
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'videos' AND column_name = 'file_id'
+        """)
+        has_file_id = cur.fetchone()
+        if not has_file_id:
+            # Purani broken table drop karo
+            logger.warning("videos table missing file_id — recreating all tables.")
+            cur.execute("DROP TABLE IF EXISTS broadcasts CASCADE")
+            cur.execute("DROP TABLE IF EXISTS verifications CASCADE")
+            cur.execute("DROP TABLE IF EXISTS videos CASCADE")
+            cur.execute("DROP TABLE IF EXISTS users CASCADE")
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS videos (
                 id         SERIAL PRIMARY KEY,
