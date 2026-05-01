@@ -443,7 +443,6 @@ async def send_video_to_user(
             chat_id=user_id,
             video=video["file_id"],
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-            protect_content=True,
         )
         db_update_user(
             user_id,
@@ -452,8 +451,16 @@ async def send_video_to_user(
             last_video_sent_at=datetime.now(timezone.utc),
         )
     except TelegramError as e:
-        logger.error(f"send_video error: {e}")
-        await context.bot.send_message(user_id, "❌ Video load nahi hui। Dobara try karo।")
+        logger.error(f"send_video error for uid={user_id} index={index}: {e}")
+        # file_id stale ho sakta hai — DB se hata do aur skip karo
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM videos WHERE file_id = %s", (video["file_id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        logger.warning(f"Removed stale file_id: {video['file_id']}")
 
 
 async def send_verification_message(context: ContextTypes.DEFAULT_TYPE, user_id: int):
@@ -701,15 +708,24 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     message = update.channel_post
     if not message or message.chat.id != CHANNEL_ID:
         return
-    if not message.video:
+
+    # Video ya document type video dono support
+    file_id = None
+    if message.video:
+        file_id = message.video.file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("video/"):
+        file_id = message.document.file_id
+
+    if not file_id:
         return
 
-    db_save_video(message.video.file_id, message.message_id)
-    logger.info(f"New video saved from channel: {message.video.file_id}")
+    db_save_video(file_id, message.message_id)
+    logger.info(f"Video saved: {file_id}")
 
-    # Sabhi active users ko naya video turant bhejo
+    # Sirf last video ke baad naya aaya ho tab active users ko bhejo
+    # (bulk upload mein har video par flood avoid karne ke liye sirf latest push hoga)
     videos = db_get_videos()
-    new_index = len(videos) - 1  # Latest video
+    new_index = len(videos) - 1
     now = datetime.now(timezone.utc)
 
     conn = get_conn()
@@ -729,9 +745,9 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await send_video_to_user(context, uid, new_index, videos)
             sent_count += 1
         except TelegramError as e:
-            logger.warning(f"New video notify uid={uid}: {e}")
+            logger.warning(f"Push uid={uid}: {e}")
 
-    # seen_all reset karo — naya content hai ab
+    # seen_all reset — naya content available
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -740,7 +756,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     finally:
         conn.close()
 
-    logger.info(f"New video pushed to {sent_count} active user(s).")
+    logger.info(f"Pushed to {sent_count} active user(s).")
 
 
 # ─────────────────────────────────────────────
