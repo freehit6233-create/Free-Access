@@ -1,669 +1,676 @@
 """
-VVIP Video Telegram Bot
-Author: SYNAX
-Features: Video navigation, free limit, VPLink verification, admin panel, auto-delete
+Advanced Telegram Video Bot
+- Private channel se auto-fetch
+- 3 free videos, phir VP link verification (3 hours access)
+- protect_content=True, no download/forward
+- Admin: /status, /reset, /broadcast (12hr auto-delete)
+- APScheduler for timed tasks
+- Neon PostgreSQL via psycopg2
 """
 
+import os
 import asyncio
 import logging
-import os
-import aiohttp
+import random
+import hashlib
+import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery,
+import aiohttp
+
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from telegram import (
+    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
+    InputMediaPhoto,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+from telegram.error import TelegramError
 
-import asyncpg
-
+# ─────────────────────────────────────────────
+# ENV & LOGGING
+# ─────────────────────────────────────────────
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN          = os.getenv("BOT_TOKEN")
-ADMIN_ID           = int(os.getenv("ADMIN_ID", "0"))
-PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
-DATABASE_URL       = os.getenv("DATABASE_URL")
-VPLINK_API         = os.getenv("VPLINK_API")          # base URL of VPLink API
-BOT_USERNAME       = os.getenv("BOT_USERNAME", "")    # without @
+BOT_TOKEN    = os.getenv("BOT_TOKEN")
+ADMIN_ID     = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID   = int(os.getenv("CHANNEL_ID", "0"))   # e.g. -1001234567890
+DATABASE_URL = os.getenv("DATABASE_URL")            # Neon postgres://...
+VP_API_KEY   = os.getenv("VP_API_KEY", "")          # VP link shortener key
 
-DEFAULT_FREE_HOURS = 3
-FREE_VIDEO_LIMIT   = 3
-AUTO_DELETE_SEC    = 600   # 10 minutes
-HELP_DELETE_SEC    = 10
-BROADCAST_DELETE_H = 12
+FREE_LIMIT      = 3          # Free videos per session
+ACCESS_HOURS    = 3          # Hours access after verification
+BROADCAST_HOURS = 12         # Hours before broadcast auto-delete
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger(__name__)
-
-# ── DB pool (global) ──────────────────────────────────────────────────────────
-pool: asyncpg.Pool = None
-
-async def get_pool() -> asyncpg.Pool:
-    global pool
-    if pool is None:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    return pool
-
-# ── DB helpers ────────────────────────────────────────────────────────────────
-async def init_db():
-    p = await get_pool()
-    async with p.acquire() as conn:
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id      BIGINT PRIMARY KEY,
-            username     TEXT,
-            full_name    TEXT,
-            video_index  INT  DEFAULT 0,
-            free_used    INT  DEFAULT 0,
-            access_until TIMESTAMPTZ,
-            last_reset   TIMESTAMPTZ DEFAULT NOW(),
-            joined_at    TIMESTAMPTZ DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS settings (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS verifications (
-            id          SERIAL PRIMARY KEY,
-            user_id     BIGINT,
-            verified_at TIMESTAMPTZ DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS broadcast_msgs (
-            id          SERIAL PRIMARY KEY,
-            chat_id     BIGINT,
-            message_id  BIGINT,
-            delete_at   TIMESTAMPTZ
-        );
-
-        CREATE TABLE IF NOT EXISTS videos (
-            id         SERIAL PRIMARY KEY,
-            message_id BIGINT UNIQUE NOT NULL,
-            added_at   TIMESTAMPTZ DEFAULT NOW()
-        );
-        """)
-        # seed default free_hours setting
-        await conn.execute("""
-            INSERT INTO settings (key, value) VALUES ('free_hours', $1)
-            ON CONFLICT (key) DO NOTHING
-        """, str(DEFAULT_FREE_HOURS))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
-async def upsert_user(user_id: int, username: str, full_name: str):
-    p = await get_pool()
-    async with p.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id, username, full_name)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id) DO UPDATE
-            SET username=$2, full_name=$3
-        """, user_id, username or "", full_name)
+# ─────────────────────────────────────────────
+# DATABASE HELPERS
+# ─────────────────────────────────────────────
+def get_conn():
+    """Neon PostgreSQL connection (sslmode=require automatic in Neon URL)."""
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
-async def get_user(user_id: int) -> asyncpg.Record | None:
-    p = await get_pool()
-    async with p.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+def init_db():
+    """Create tables if not exist."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS videos (
+                    id          SERIAL PRIMARY KEY,
+                    file_id     TEXT UNIQUE NOT NULL,
+                    message_id  BIGINT,
+                    added_at    TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id         BIGINT PRIMARY KEY,
+                    videos_watched  INT DEFAULT 0,
+                    access_until    TIMESTAMPTZ,
+                    verify_token    TEXT,
+                    token_created   TIMESTAMPTZ,
+                    last_index      INT DEFAULT 0,
+                    seen_all        BOOLEAN DEFAULT FALSE
+                );
+
+                CREATE TABLE IF NOT EXISTS verifications (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     BIGINT,
+                    verified_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS broadcasts (
+                    id              SERIAL PRIMARY KEY,
+                    chat_id         BIGINT,
+                    message_id      BIGINT,
+                    delete_at       TIMESTAMPTZ,
+                    created_at      TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+        conn.commit()
+    logger.info("Database initialised.")
 
 
-async def update_user(user_id: int, **kwargs):
+# ── Video DB ──────────────────────────────────
+
+def db_save_video(file_id: str, message_id: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO videos (file_id, message_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (file_id, message_id),
+            )
+        conn.commit()
+
+
+def db_get_videos() -> list:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM videos ORDER BY id")
+            return cur.fetchall()
+
+
+def db_video_count() -> int:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM videos")
+            return cur.fetchone()[0]
+
+
+# ── User DB ───────────────────────────────────
+
+def db_get_user(user_id: int) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+            return cur.fetchone()
+
+
+def db_upsert_user(user_id: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (user_id,),
+            )
+        conn.commit()
+
+
+def db_update_user(user_id: int, **kwargs):
     if not kwargs:
         return
-    p = await get_pool()
-    async with p.acquire() as conn:
-        sets = ", ".join(f"{k}=${i+2}" for i, k in enumerate(kwargs))
-        vals = list(kwargs.values())
-        await conn.execute(
-            f"UPDATE users SET {sets} WHERE user_id=$1",
-            user_id, *vals
-        )
+    sets = ", ".join(f"{k} = %s" for k in kwargs)
+    vals = list(kwargs.values()) + [user_id]
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE users SET {sets} WHERE user_id = %s", vals)
+        conn.commit()
 
 
-async def get_setting(key: str) -> str:
-    p = await get_pool()
-    async with p.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", key)
-        return row["value"] if row else None
+def db_reset_all_access():
+    """Admin /reset: revoke all verified access."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET access_until = NULL, videos_watched = 0")
+        conn.commit()
 
 
-async def set_setting(key: str, value: str):
-    p = await get_pool()
-    async with p.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO settings (key, value) VALUES ($1, $2)
-            ON CONFLICT (key) DO UPDATE SET value=$2
-        """, key, value)
+# ── Verification DB ───────────────────────────
+
+def db_log_verification(user_id: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO verifications (user_id) VALUES (%s)", (user_id,))
+        conn.commit()
 
 
-async def log_verification(user_id: int):
-    p = await get_pool()
-    async with p.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO verifications (user_id) VALUES ($1)", user_id
-        )
+def db_verifications_24h() -> int:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM verifications WHERE verified_at > NOW() - INTERVAL '24 hours'"
+            )
+            return cur.fetchone()[0]
 
 
-async def verifications_last_24h() -> int:
-    p = await get_pool()
-    async with p.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT COUNT(*) as cnt FROM verifications WHERE verified_at > NOW() - INTERVAL '24 hours'"
-        )
-        return row["cnt"]
+# ── Broadcast DB ─────────────────────────────
+
+def db_save_broadcast(chat_id: int, message_id: int, delete_at: datetime):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO broadcasts (chat_id, message_id, delete_at) VALUES (%s, %s, %s)",
+                (chat_id, message_id, delete_at),
+            )
+        conn.commit()
 
 
-async def all_user_ids() -> list[int]:
-    p = await get_pool()
-    async with p.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id FROM users")
-        return [r["user_id"] for r in rows]
+def db_due_broadcasts() -> list:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM broadcasts WHERE delete_at <= NOW()"
+            )
+            return cur.fetchall()
 
 
-async def save_video(message_id: int):
-    p = await get_pool()
-    async with p.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO videos (message_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            message_id
-        )
+def db_delete_broadcast_record(bid: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM broadcasts WHERE id = %s", (bid,))
+        conn.commit()
 
 
-async def delete_video(message_id: int):
-    p = await get_pool()
-    async with p.acquire() as conn:
-        await conn.execute("DELETE FROM videos WHERE message_id=$1", message_id)
+# ─────────────────────────────────────────────
+# VERIFICATION TOKEN LOGIC
+# ─────────────────────────────────────────────
+def generate_token(user_id: int) -> str:
+    """Create a unique token tied to user_id + current timestamp."""
+    raw = f"{user_id}:{time.time()}:{VP_API_KEY}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-async def get_all_video_ids() -> list[int]:
-    p = await get_pool()
-    async with p.acquire() as conn:
-        rows = await conn.fetch("SELECT message_id FROM videos ORDER BY added_at ASC")
-        return [r["message_id"] for r in rows]
+async def build_vp_link(token: str) -> str:
+    """
+    VPLink API se actual short URL banao.
+    Exact format: https://vplink.in/api?api=KEY&url=DEST&alias=ALIAS&format=text
 
+    format=text  → response mein sirf plain short URL aata hai (no JSON parsing)
+    alias        → token ke pehle 8 chars se unique custom alias
+    """
+    bot_username = os.getenv("BOT_USERNAME", "RNDAccess_bot")
+    # User verify hoke is deep-link pe wapas aayega
+    destination  = f"https://t.me/{bot_username}?start=verify_{token}"
+    encoded_dest = urllib.parse.quote(destination, safe="")
+    alias        = f"v{token[:8]}"   # e.g. "vaBcD1234" — unique per token
 
-async def save_broadcast_msg(chat_id: int, message_id: int, delete_at: datetime):
-    p = await get_pool()
-    async with p.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO broadcast_msgs (chat_id, message_id, delete_at) VALUES ($1, $2, $3)",
-            chat_id, message_id, delete_at
-        )
-
-# ── Bot / Dispatcher ──────────────────────────────────────────────────────────
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp  = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
-
-# ── Utility ───────────────────────────────────────────────────────────────────
-async def get_channel_videos() -> list[int]:
-    """Return list of message IDs from DB (saved when videos were posted to channel)."""
-    return await get_all_video_ids()
-
-
-# cache videos to avoid repeated API calls
-_video_cache: list[int] = []
-_cache_time: datetime   = None
-
-async def cached_videos() -> list[int]:
-    global _video_cache, _cache_time
-    now = datetime.now(timezone.utc)
-    if not _video_cache or (_cache_time and (now - _cache_time).seconds > 300):
-        _video_cache = await get_channel_videos()
-        _cache_time  = now
-    return _video_cache
-
-
-def nav_keyboard(index: int, total: int, show_get_link=False) -> InlineKeyboardMarkup:
-    buttons = []
-    row = []
-    if index > 0:
-        row.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"nav:{index-1}"))
-    if index < total - 1:
-        row.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"nav:{index+1}"))
-    if row:
-        buttons.append(row)
-    if show_get_link:
-        buttons.append([InlineKeyboardButton(text="🔗 Get Link", callback_data="get_link")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-async def send_video_to_user(user_id: int, index: int, bot_instance: Bot):
-    videos = await cached_videos()
-    if not videos or index >= len(videos):
-        await bot_instance.send_message(user_id, "⚠️ No videos found in channel.")
-        return
-
-    msg_id = videos[index]
-    total  = len(videos)
-    kb     = nav_keyboard(index, total)
+    api_url = (
+        f"https://vplink.in/api"
+        f"?api={VP_API_KEY}"
+        f"&url={encoded_dest}"
+        f"&alias={alias}"
+        f"&format=text"
+    )
 
     try:
-        sent = await bot_instance.copy_message(
-            chat_id=user_id,
-            from_chat_id=PRIVATE_CHANNEL_ID,
-            message_id=msg_id,
-            protect_content=True,
-            reply_markup=kb
-        )
-        # schedule auto-delete after 10 min
-        asyncio.create_task(auto_delete(user_id, sent.message_id, AUTO_DELETE_SEC))
-    except Exception as e:
-        log.error(f"send_video error: {e}")
-        await bot_instance.send_message(user_id, f"⚠️ Could not load video #{index+1}.")
-
-
-async def auto_delete(chat_id: int, message_id: int, delay: int):
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id, message_id)
-    except Exception:
-        pass
-
-
-async def check_and_reset_free(user: asyncpg.Record) -> asyncpg.Record:
-    """If 24h passed since last_reset, reset free_used counter."""
-    now = datetime.now(timezone.utc)
-    last_reset = user["last_reset"]
-    if last_reset and (now - last_reset) >= timedelta(hours=24):
-        await update_user(user["user_id"], free_used=0, last_reset=now)
-        # re-fetch
-        return await get_user(user["user_id"])
-    return user
-
-
-async def user_has_active_access(user: asyncpg.Record) -> bool:
-    au = user["access_until"]
-    if au and au > datetime.now(timezone.utc):
-        return True
-    return False
-
-
-async def generate_vplink(user_id: int) -> str:
-    """Call VPLink API to generate a short verification link."""
-    callback_url = f"https://t.me/{BOT_USERNAME}?start=verify_{user_id}"
-
-    if not VPLINK_API:
-        return callback_url
-
-    try:
-        # VPLINK_API format: https://vplink.in/api?api=YOUR_KEY&url=
-        # Just append the encoded callback URL directly
-        import urllib.parse
-        full_url = VPLINK_API + urllib.parse.quote(callback_url, safe="")
-
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                full_url,
+                api_url,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
-                text = await resp.text()
-                log.info(f"VPLink raw response: {text}")
-                try:
-                    data = await resp.json(content_type=None)
-                    short = (
-                        data.get("shortenedUrl")
-                        or data.get("short_url")
-                        or data.get("shortened_url")
-                        or data.get("shortLink")
-                        or data.get("link")
-                    )
-                    return short if short else callback_url
-                except Exception:
-                    # Some shorteners return plain URL as text
-                    text = text.strip()
-                    if text.startswith("http"):
-                        return text
-                    return callback_url
+                text = (await resp.text()).strip()
+                # format=text → response sirf short URL hota hai
+                # e.g.  https://vplink.in/vaBcD1234
+                if text.startswith("http"):
+                    logger.info(f"VPLink short URL: {text}")
+                    return text
+                # Alias already taken? retry without alias
+                logger.warning(f"VPLink API returned: {text} — retrying without alias")
+                retry_url = (
+                    f"https://vplink.in/api"
+                    f"?api={VP_API_KEY}"
+                    f"&url={encoded_dest}"
+                    f"&format=text"
+                )
+                async with session.get(
+                    retry_url,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp2:
+                    text2 = (await resp2.text()).strip()
+                    if text2.startswith("http"):
+                        logger.info(f"VPLink short URL (no alias): {text2}")
+                        return text2
+                    logger.error(f"VPLink retry also failed: {text2}")
     except Exception as e:
-        log.warning(f"VPLink error: {e}")
-        return callback_url
+        logger.error(f"VPLink API exception: {e}")
 
-# ── Channel Post Handler ──────────────────────────────────────────────────────
-@router.channel_post(F.chat.id == PRIVATE_CHANNEL_ID)
-async def on_channel_post(message: Message):
-    """Auto-save video/document message IDs from private channel to DB."""
-    if message.video or message.document:
-        await save_video(message.message_id)
-        # Invalidate cache so next request fetches fresh list
-        global _video_cache, _cache_time
-        _video_cache = []
-        _cache_time  = None
-        log.info(f"New video saved from channel: message_id={message.message_id}")
+    # Fallback: API fail hone par direct destination URL use karo
+    logger.warning("VPLink failed — using direct Telegram deep-link as fallback.")
+    return destination
 
 
-@router.edited_channel_post(F.chat.id == PRIVATE_CHANNEL_ID)
-async def on_channel_post_deleted(message: Message):
-    """Handle edited posts — if video removed, clean up."""
-    if not message.video and not message.document:
-        await delete_video(message.message_id)
-        global _video_cache, _cache_time
-        _video_cache = []
-        _cache_time  = None
+def has_valid_access(user: dict) -> bool:
+    if not user or not user.get("access_until"):
+        return False
+    now = datetime.now(timezone.utc)
+    access_until = user["access_until"]
+    # psycopg2 returns timezone-aware datetime for TIMESTAMPTZ
+    if access_until.tzinfo is None:
+        access_until = access_until.replace(tzinfo=timezone.utc)
+    return now < access_until
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    user = message.from_user
-    await upsert_user(user.id, user.username, user.full_name)
+# ─────────────────────────────────────────────
+# VIDEO SENDING HELPER
+# ─────────────────────────────────────────────
+async def send_video_to_user(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    index: int,
+    videos: list,
+):
+    """Send video at `index` with Prev/Next navigation buttons."""
+    total = len(videos)
+    if total == 0:
+        await context.bot.send_message(user_id, "⚠️ Abhi koi video available nahi hai.")
+        return
 
-    # handle verify callback: /start verify_<user_id>
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1 and args[1].startswith("verify_"):
-        try:
-            vid = int(args[1].split("_")[1])
-        except Exception:
-            vid = None
-        if vid == user.id:
-            await handle_verification(message, user.id)
+    video = videos[index % total]
+    buttons = []
+
+    if total > 1:
+        prev_idx = (index - 1) % total
+        next_idx = (index + 1) % total
+        buttons.append([
+            InlineKeyboardButton("⬅️ Previous", callback_data=f"nav_{prev_idx}"),
+            InlineKeyboardButton("Next ➡️", callback_data=f"nav_{next_idx}"),
+        ])
+
+    markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    try:
+        await context.bot.send_video(
+            chat_id=user_id,
+            video=video["file_id"],
+            caption=f"🎬 Video {index + 1} / {total}",
+            reply_markup=markup,
+            protect_content=True,   # No download, no forward
+        )
+        # Update user's last watched index
+        db_update_user(user_id, last_index=index)
+    except TelegramError as e:
+        logger.error(f"Video send error (file_id={video['file_id']}): {e}")
+        await context.bot.send_message(user_id, "❌ Video load nahi ho saki. Dobara try karein.")
+
+
+async def send_verification_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+):
+    """Show verification prompt when free limit is reached."""
+    token = generate_token(user_id)
+    db_update_user(
+        user_id,
+        verify_token=token,
+        token_created=datetime.now(timezone.utc),
+    )
+    vp_url = await build_vp_link(token)
+
+    text = (
+        "🔒 *Free limit khatam ho gayi!*\n\n"
+        "✅ Neeche diye link ko verify karo aur *3 ghante ki free access* pao.\n\n"
+        "📌 Steps:\n"
+        "1️⃣ 'Get Link' button dabao\n"
+        "2️⃣ Jo page khule uspe ad close karke wait karo\n"
+        "3️⃣ Verify ho jaega, wapas bot pe aao\n\n"
+        "⏳ Access milne ke baad 3 ghante valid rahega."
+    )
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔗 Get Link", url=vp_url)
+    ]])
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+
+# ─────────────────────────────────────────────
+# COMMAND HANDLERS
+# ─────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /start  OR  /start verify_<token>
+    """
+    user_id = update.effective_user.id
+    db_upsert_user(user_id)
+    user = db_get_user(user_id)
+
+    # ── Deep-link verification ──────────────────
+    args = context.args  # list of words after /start
+    if args and args[0].startswith("verify_"):
+        token_from_link = args[0][len("verify_"):]
+        stored_token    = user.get("verify_token") if user else None
+        token_created   = user.get("token_created") if user else None
+
+        valid = False
+        if stored_token and token_from_link == stored_token and token_created:
+            # Token must be fresh (< 30 min)
+            if token_created.tzinfo is None:
+                token_created = token_created.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - token_created).total_seconds()
+            if age < 1800:
+                valid = True
+
+        if valid:
+            access_until = datetime.now(timezone.utc) + timedelta(hours=ACCESS_HOURS)
+            db_update_user(
+                user_id,
+                access_until=access_until,
+                verify_token=None,
+                token_created=None,
+                videos_watched=0,
+            )
+            db_log_verification(user_id)
+            await update.message.reply_text(
+                f"✅ *Verification successful!*\n\n"
+                f"🎉 Tumhare paas *{ACCESS_HOURS} ghante* ki free access hai.\n"
+                f"Ab videos enjoy karo! 🎬",
+                parse_mode="Markdown",
+            )
+            # Show first video
+            videos = db_get_videos()
+            user = db_get_user(user_id)
+            await send_video_to_user(update, context, user_id, user.get("last_index", 0), videos)
+            return
+        else:
+            await update.message.reply_text(
+                "❌ Verification link invalid ya expired hai. Dobara try karo.",
+            )
             return
 
-    db_user = await get_user(user.id)
-    db_user = await check_and_reset_free(db_user)
-
-    has_access = await user_has_active_access(db_user)
-    free_used  = db_user["free_used"]
-
-    # limit reached — show Get Link button instead of video
-    if not has_access and free_used >= FREE_VIDEO_LIMIT:
-        free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
-        link = await generate_vplink(user.id)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Get Link", url=link)]
-        ])
-        await message.answer(
-            f"👋 <b>Welcome back, {user.first_name}!</b>\n\n"
-            f"🔒 <b>Verify This Link Get {free_hours} Hour Access</b>\n\n"
-            f"Aapne apne {FREE_VIDEO_LIMIT} free videos dekh liye.\n"
-            f"Neeche diye link ko verify karo aur <b>{free_hours} ghante</b> ka free access pao! ✅",
-            reply_markup=kb,
-            parse_mode="HTML"
+    # ── Normal /start ───────────────────────────
+    videos = db_get_videos()
+    if not videos:
+        await update.message.reply_text(
+            "👋 *Bot mein aapka swagat hai!*\n\nAbhi koi video available nahi. Jaldi aayengi!",
+            parse_mode="Markdown",
         )
         return
 
-    welcome = (
-        f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
-        f"🎬 You have <b>{FREE_VIDEO_LIMIT - free_used}</b> free videos remaining."
-    )
-    await message.answer(welcome)
-    await send_video_to_user(user.id, db_user['video_index'], bot)
+    # Check access
+    if has_valid_access(user):
+        idx = user.get("last_index", 0)
+        await send_video_to_user(update, context, user_id, idx, videos)
+    elif (user.get("videos_watched") or 0) < FREE_LIMIT:
+        idx = user.get("last_index", 0)
+        await send_video_to_user(update, context, user_id, idx, videos)
+    else:
+        await send_verification_message(update, context, user_id)
 
 
-async def handle_verification(message: Message, user_id: int):
-    db_user = await get_user(user_id)
-    free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
-    access_until = datetime.now(timezone.utc) + timedelta(hours=free_hours)
-
-    # Set access_until in DB — this is the gate
-    await update_user(user_id, access_until=access_until)
-    await log_verification(user_id)
-
-    # Verify it actually saved
-    db_user = await get_user(user_id)
-    if not await user_has_active_access(db_user):
-        await message.answer("❌ Verification failed. Please try again.")
-        return
-
-    name = message.from_user.full_name
-    await message.answer(
-        f"✅ <b>Verified! {free_hours} hour access active hai, {name}!</b>\n"
-        f"⏰ Access expires: <code>{access_until.strftime('%H:%M UTC')}</code>\n\n"
-        f"🎬 Enjoy watching!",
-        parse_mode="HTML"
-    )
-
-    # notify admin
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🔔 <b>New Verification!</b>\n"
-            f"👤 Name: <a href='tg://user?id={user_id}'>{name}</a>\n"
-            f"🆔 ID: <code>{user_id}</code>\n"
-            f"⏰ Access until: {access_until.strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-    except Exception:
-        pass
-
-    # send video immediately after verification
-    await asyncio.sleep(1)
-    await send_video_to_user(user_id, db_user["video_index"], bot)
-
-    # schedule access expiry notification
-    asyncio.create_task(notify_access_expired(user_id, free_hours * 3600))
-
-
-async def notify_access_expired(user_id: int, delay: int):
-    await asyncio.sleep(delay)
-    try:
-        await bot.send_message(
-            user_id,
-            "⏰ <b>Your free access has expired.</b>\n"
-            "You'll get 3 free videos again in 24 hours, or verify a new link for more access!"
-        )
-    except Exception:
-        pass
-
-# ── Navigation Callback ───────────────────────────────────────────────────────
-@router.callback_query(F.data.startswith("nav:"))
-async def nav_callback(call: CallbackQuery):
-    user_id = call.from_user.id
-    index   = int(call.data.split(":")[1])
-
-    db_user = await get_user(user_id)
-    if not db_user:
-        await upsert_user(user_id, call.from_user.username, call.from_user.full_name)
-        db_user = await get_user(user_id)
-
-    db_user = await check_and_reset_free(db_user)
-
-    has_access = await user_has_active_access(db_user)
-    free_used  = db_user["free_used"]
-
-    # check if free limit exceeded
-    if not has_access and free_used >= FREE_VIDEO_LIMIT:
-        free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
-        link = await generate_vplink(user_id)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Get Link", url=link)]
-        ])
-        # delete old video message first
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
-        await bot.send_message(
-            user_id,
-            f"🔒 <b>Verify This Link Get {free_hours} Hour Access</b>\n\n"
-            f"Aapne apne {FREE_VIDEO_LIMIT} free videos dekh liye.\n"
-            f"Neeche diye link ko verify karo aur <b>{free_hours} ghante</b> ka free access pao! ✅",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-        await call.answer()
-        return
-
-    # update index and free_used counter
-    new_free = free_used + 1 if not has_access else free_used
-    await update_user(user_id, video_index=index, free_used=new_free)
-
-    # delete the previous video message
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-
-    await call.answer()
-    await send_video_to_user(user_id, index, bot)
-
-
-@router.callback_query(F.data == "get_link")
-async def get_link_callback(call: CallbackQuery):
-    user_id    = call.from_user.id
-    free_hours = int(await get_setting("free_hours") or DEFAULT_FREE_HOURS)
-    link = await generate_vplink(user_id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Verify Now", url=link)]
-    ])
-    await call.message.edit_reply_markup(reply_markup=kb)
-    await call.answer(f"Get {free_hours}h free access by verifying the link!", show_alert=True)
-
-# ── /help ─────────────────────────────────────────────────────────────────────
-@router.message(Command("help"))
-async def cmd_help(message: Message):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📖 <b>Bot Help</b>\n\n"
-        "/start — Start watching videos\n"
-        "/help — Show this message\n\n"
-        "<b>Free users:</b> 3 videos free every 24 hours.\n"
-        "Verify a link to unlock more hours!\n\n"
-        "<i>This message will auto-delete in 10 seconds.</i>"
+        "ℹ️ *Bot Usage Guide*\n\n"
+        "▶️ /start — Bot shuru karo\n"
+        "❓ /help  — Yeh message\n\n"
+        "📌 *Features:*\n"
+        "• Pehli 3 videos bilkul free\n"
+        "• Uske baad link verify karo → 3 ghante ki access\n"
+        "• ⬅️ Previous / Next ➡️ buttons se navigate karo\n"
+        "• Videos forward ya download nahi ho sakti (protected)\n\n"
+        "🔒 Verification ke baad bhi access expire hone par dobara verify karna hoga."
     )
-    sent = await message.answer(text)
-    asyncio.create_task(auto_delete(message.chat.id, sent.message_id, HELP_DELETE_SEC))
-    asyncio.create_task(auto_delete(message.chat.id, message.message_id, HELP_DELETE_SEC))
-
-# ── Admin Commands ────────────────────────────────────────────────────────────
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
-@router.message(Command("status"))
-async def cmd_status(message: Message):
-    if not is_admin(message.from_user.id):
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only."""
+    if update.effective_user.id != ADMIN_ID:
         return
-    videos   = await cached_videos()
-    verifs   = await verifications_last_24h()
-    p        = await get_pool()
-    async with p.acquire() as conn:
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
-    free_hours  = await get_setting("free_hours")
-    await message.answer(
-        f"📊 <b>Bot Status</b>\n\n"
-        f"🎬 Videos in channel: <b>{len(videos)}</b>\n"
-        f"✅ Verifications (24h): <b>{verifs}</b>\n"
-        f"👥 Total users: <b>{total_users}</b>\n"
-        f"⏱ Free access hours: <b>{free_hours}</b>"
+    verifs = db_verifications_24h()
+    vcount = db_video_count()
+    await update.message.reply_text(
+        f"📊 *Bot Status*\n\n"
+        f"✅ Last 24h verifications: *{verifs}*\n"
+        f"🎬 Total videos in DB: *{vcount}*",
+        parse_mode="Markdown",
     )
 
 
-@router.message(Command("settimer"))
-async def cmd_set_timer(message: Message):
-    if not is_admin(message.from_user.id):
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only — reset all user access."""
+    if update.effective_user.id != ADMIN_ID:
         return
-    parts = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Usage: /settimer <hours>\nExample: /settimer 6")
-        return
-    hours = int(parts[1])
-    await set_setting("free_hours", str(hours))
-    await message.answer(f"✅ Free access timer set to <b>{hours} hours</b>.")
+    db_reset_all_access()
+    await update.message.reply_text("♻️ Sabhi users ka access reset kar diya gaya. Sabko fir verify karna hoga.")
 
 
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    if not message.reply_to_message:
-        await message.answer("⚠️ Reply to a message to broadcast it.")
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin only.
+    Usage: Reply to a photo with /broadcast <caption text> <optional link>
+    Or: /broadcast <text message>
+    Broadcast auto-deletes after BROADCAST_HOURS.
+    """
+    if update.effective_user.id != ADMIN_ID:
         return
 
-    user_ids   = await all_user_ids()
-    delete_at  = datetime.now(timezone.utc) + timedelta(hours=BROADCAST_DELETE_H)
-    success, fail = 0, 0
+    message = update.message
 
-    status_msg = await message.answer(f"📢 Broadcasting to {len(user_ids)} users...")
+    # Collect all bot users
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users")
+            all_users = [r[0] for r in cur.fetchall()]
 
-    for uid in user_ids:
-        try:
-            sent = await message.reply_to_message.copy_to(uid)
-            await save_broadcast_msg(uid, sent.message_id, delete_at)
-            success += 1
-            await asyncio.sleep(0.05)  # rate limit
-        except Exception:
-            fail += 1
-
-    await status_msg.edit_text(
-        f"✅ Broadcast complete!\n"
-        f"Sent: {success} | Failed: {fail}\n"
-        f"🗑 Auto-delete in {BROADCAST_DELETE_H} hours."
-    )
-
-
-@router.message(Command("ban"))
-async def cmd_ban(message: Message):
-    if not is_admin(message.from_user.id):
+    if not all_users:
+        await message.reply_text("Koi user nahi mila.")
         return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Usage: /ban <user_id>")
-        return
-    uid = int(parts[1])
-    await update_user(uid, access_until=datetime(2000, 1, 1, tzinfo=timezone.utc))
-    await message.answer(f"🚫 User <code>{uid}</code> banned.")
 
+    delete_at = datetime.now(timezone.utc) + timedelta(hours=BROADCAST_HOURS)
+    sent_count = 0
+    failed_count = 0
 
-@router.message(Command("unban"))
-async def cmd_unban(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Usage: /unban <user_id>")
-        return
-    uid = int(parts[1])
-    await update_user(uid, access_until=None, free_used=0)
-    await message.answer(f"✅ User <code>{uid}</code> unbanned.")
-
-# ── Scheduled Tasks ───────────────────────────────────────────────────────────
-async def delete_expired_broadcasts():
-    """Delete broadcast messages that are past their delete_at time."""
-    p = await get_pool()
-    async with p.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, chat_id, message_id FROM broadcast_msgs WHERE delete_at <= NOW()"
-        )
-        for row in rows:
+    # Build caption
+    caption = " ".join(context.args) if context.args else ""
+    if message.reply_to_message and message.reply_to_message.photo:
+        photo = message.reply_to_message.photo[-1].file_id
+        for uid in all_users:
             try:
-                await bot.delete_message(row["chat_id"], row["message_id"])
-            except Exception:
-                pass
-        if rows:
-            ids = [r["id"] for r in rows]
-            await conn.execute("DELETE FROM broadcast_msgs WHERE id=ANY($1)", ids)
+                sent = await context.bot.send_photo(
+                    chat_id=uid,
+                    photo=photo,
+                    caption=caption or None,
+                    parse_mode="Markdown",
+                )
+                db_save_broadcast(uid, sent.message_id, delete_at)
+                sent_count += 1
+            except TelegramError:
+                failed_count += 1
+    else:
+        text = caption or (message.text.replace("/broadcast", "").strip())
+        if not text:
+            await message.reply_text("❌ Koi message ya photo nahi mili. Usage: /broadcast <text> ya photo reply ke saath.")
+            return
+        for uid in all_users:
+            try:
+                sent = await context.bot.send_message(
+                    chat_id=uid,
+                    text=text,
+                    parse_mode="Markdown",
+                )
+                db_save_broadcast(uid, sent.message_id, delete_at)
+                sent_count += 1
+            except TelegramError:
+                failed_count += 1
+
+    await message.reply_text(
+        f"📢 Broadcast bheja!\n✅ Sent: {sent_count}\n❌ Failed: {failed_count}\n"
+        f"🗑️ Auto-delete: {BROADCAST_HOURS} ghante baad"
+    )
 
 
-async def refresh_video_cache():
-    global _video_cache, _cache_time
-    _video_cache = await get_channel_videos()
-    _cache_time  = datetime.now(timezone.utc)
-    log.info(f"Video cache refreshed: {len(_video_cache)} videos")
+# ─────────────────────────────────────────────
+# CALLBACK QUERY — Navigation Buttons
+# ─────────────────────────────────────────────
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-async def main():
-    await init_db()
-    log.info("Database initialized.")
+async def callback_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
+    user_id = query.from_user.id
+    db_upsert_user(user_id)
+    user = db_get_user(user_id)
+    videos = db_get_videos()
+
+    if not videos:
+        await query.message.reply_text("⚠️ Koi video nahi mili.")
+        return
+
+    data = query.data  # "nav_<index>"
+    try:
+        requested_index = int(data.split("_")[1])
+    except (IndexError, ValueError):
+        return
+
+    total = len(videos)
+    watched = user.get("videos_watched") or 0
+
+    # ── Access check ─────────────────────────────
+    if not has_valid_access(user):
+        if watched >= FREE_LIMIT:
+            await send_verification_message(update, context, user_id)
+            return
+        # Increment watched counter
+        db_update_user(user_id, videos_watched=watched + 1)
+        user = db_get_user(user_id)  # refresh
+
+    # ── Random mode if seen all ───────────────────
+    seen_all = user.get("seen_all") or False
+    if not seen_all and requested_index >= total:
+        db_update_user(user_id, seen_all=True)
+        seen_all = True
+
+    if seen_all:
+        requested_index = random.randint(0, total - 1)
+
+    await send_video_to_user(update, context, user_id, requested_index, videos)
+
+
+# ─────────────────────────────────────────────
+# CHANNEL POST LISTENER — Auto-fetch videos
+# ─────────────────────────────────────────────
+
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-save videos posted to the private channel."""
+    message = update.channel_post
+    if not message:
+        return
+    if message.chat.id != CHANNEL_ID:
+        return
+    if message.video:
+        file_id = message.video.file_id
+        db_save_video(file_id, message.message_id)
+        logger.info(f"New video saved: {file_id}")
+
+
+# ─────────────────────────────────────────────
+# SCHEDULED TASKS (APScheduler)
+# ─────────────────────────────────────────────
+
+async def job_delete_broadcasts(app):
+    """Delete expired broadcast messages."""
+    due = db_due_broadcasts()
+    for row in due:
+        try:
+            await app.bot.delete_message(chat_id=row["chat_id"], message_id=row["message_id"])
+        except TelegramError as e:
+            logger.warning(f"Could not delete broadcast msg {row['message_id']}: {e}")
+        db_delete_broadcast_record(row["id"])
+    if due:
+        logger.info(f"Deleted {len(due)} expired broadcast messages.")
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    init_db()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # ── Handlers ─────────────────────────────────
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("reset",     cmd_reset))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+
+    app.add_handler(CallbackQueryHandler(callback_nav, pattern=r"^nav_\d+$"))
+
+    # Channel posts (bot must be admin of channel)
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post_handler))
+
+    # ── Scheduler ────────────────────────────────
     scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(delete_expired_broadcasts, "interval", minutes=10)
-    scheduler.add_job(refresh_video_cache,        "interval", minutes=5)
+    # Run every 10 minutes to check for expired broadcasts
+    scheduler.add_job(
+        job_delete_broadcasts,
+        "interval",
+        minutes=10,
+        args=[app],
+        id="delete_broadcasts",
+    )
     scheduler.start()
 
-    log.info("Bot starting...")
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post", "edited_channel_post"])
+    logger.info("Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
