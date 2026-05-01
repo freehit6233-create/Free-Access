@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-psycopg2-binary==2.9.9
+pg8000==1.31.2
 APScheduler==3.10.4
 python-dotenv==1.0.0
 aiohttp==3.9.3
