@@ -841,6 +841,32 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_nav, pattern=r"^nav_\d+$"))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post_handler))
 
+    async def post_init(application):
+        from telegram import BotCommand
+        from telegram.constants import BotCommandScopeType
+
+        # Default (sabhi users) — sirf start aur help
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start", "Videos dekhna shuru karo"),
+                BotCommand("help",  "Help guide"),
+            ]
+        )
+
+        # Admin ke liye — sab commands
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start",     "Videos dekhna shuru karo"),
+                BotCommand("help",      "Help guide"),
+                BotCommand("status",    "Bot stats dekho"),
+                BotCommand("broadcast", "Sabko message bhejo"),
+                BotCommand("reset",     "Sabka access reset karo"),
+            ],
+            scope={"type": "chat", "chat_id": ADMIN_ID},
+        )
+
+    app.post_init = post_init
+
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(job_delete_broadcasts,      "interval", minutes=10, args=[app])
     scheduler.add_job(job_auto_delete_videos,     "interval", minutes=2,  args=[app])
