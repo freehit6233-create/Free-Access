@@ -512,6 +512,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 videos_watched=0,
             )
             db_log_verification(user_id)
+
+            # Admin ko notify karo
+            tg_user = update.effective_user
+            name = tg_user.full_name or tg_user.first_name or "Unknown"
+            username_part = f"@{tg_user.username}" if tg_user.username else "—"
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"✅ *New Verification*\n\n"
+                        f"👤 *Name:* {name}\n"
+                        f"🔗 *Username:* {username_part}\n"
+                        f"🆔 *User ID:* `{user_id}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except TelegramError as e:
+                logger.warning(f"Admin notify error: {e}")
+
             await update.message.reply_text(
                 f"✅ *Verified!*\n\n"
                 f"🎉 *{ACCESS_HOURS} ghante* ki access mil gayi — enjoy karo! 🎬",
@@ -588,21 +607,27 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent, fail = 0, 0
     caption    = " ".join(context.args) if context.args else ""
 
-    if message.reply_to_message and message.reply_to_message.photo:
-        photo = message.reply_to_message.photo[-1].file_id
+    if message.reply_to_message:
+        # Format preserve karo — copy_message use karo
+        src_msg = message.reply_to_message
         for uid in all_users:
             try:
-                sent_msg = await context.bot.send_photo(chat_id=uid, photo=photo,
-                                                        caption=caption or None, parse_mode="Markdown")
+                sent_msg = await context.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=src_msg.chat_id,
+                    message_id=src_msg.message_id,
+                )
                 db_save_broadcast(uid, sent_msg.message_id, delete_at)
                 sent += 1
             except TelegramError:
                 fail += 1
     else:
-        text = caption or message.text.replace("/broadcast", "").strip()
+        text = message.text.replace("/broadcast", "").strip()
         if not text:
-            await message.reply_text("❌ Usage:\n• `/broadcast message`\n• Photo reply ke saath `/broadcast caption`",
-                                     parse_mode="Markdown")
+            await message.reply_text(
+                "❌ *Usage:*\n• `/broadcast message`\n• Kisi bhi message ko reply karke `/broadcast`",
+                parse_mode="Markdown",
+            )
             return
         for uid in all_users:
             try:
