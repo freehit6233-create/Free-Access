@@ -446,28 +446,39 @@ async def send_video_to_user(
     user = db_get_user(user_id)
     await delete_last_video(context, user)
 
-    try:
-        sent = await context.bot.send_video(
-            chat_id=user_id,
-            video=video["file_id"],
-            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-        )
-        db_update_user(
-            user_id,
-            last_index=index,
-            last_video_msg_id=sent.message_id,
-            last_video_sent_at=datetime.now(timezone.utc),
-        )
-    except TelegramError as e:
-        logger.error(f"send_video error for uid={user_id} index={index}: {e}")
-        conn = get_conn()
+    # Max 3 tries — stale file_id skip karte hue
+    for attempt in range(min(3, total)):
+        current_index = (index + attempt) % total
+        video = videos[current_index]
         try:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM videos WHERE file_id = %s", (video["file_id"],))
-            conn.commit()
-        finally:
-            conn.close()
-        logger.warning(f"Removed stale file_id: {video['file_id']}")
+            sent = await context.bot.send_video(
+                chat_id=user_id,
+                video=video["file_id"],
+                reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+            )
+            db_update_user(
+                user_id,
+                last_index=current_index,
+                last_video_msg_id=sent.message_id,
+                last_video_sent_at=datetime.now(timezone.utc),
+            )
+            return  # Success
+        except TelegramError as e:
+            logger.error(f"send_video error uid={user_id} index={current_index}: {e}")
+            # Stale file_id — DB se hata do, next try
+            conn = get_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM videos WHERE file_id = %s", (video["file_id"],))
+                conn.commit()
+            finally:
+                conn.close()
+            logger.warning(f"Removed stale file_id: {video['file_id']}")
+            videos = db_get_videos()  # Refresh list
+            total = len(videos)
+            if total == 0:
+                await context.bot.send_message(user_id, "⚠️ Abhi koi video available nahi hai.")
+                return
 
 
 async def send_verification_message(context: ContextTypes.DEFAULT_TYPE, user_id: int):
