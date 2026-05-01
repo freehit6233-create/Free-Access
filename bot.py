@@ -143,14 +143,16 @@ def init_db():
                 last_index          INT DEFAULT 0,
                 seen_all            BOOLEAN DEFAULT FALSE,
                 last_video_msg_id   BIGINT,
-                last_video_sent_at  TIMESTAMPTZ
+                last_video_sent_at  TIMESTAMPTZ,
+                expiry_notified     BOOLEAN DEFAULT FALSE
             )
         """)
         # Existing DB mein columns add karo agar nahi hain
         cur.execute("""
             ALTER TABLE users
             ADD COLUMN IF NOT EXISTS last_video_msg_id  BIGINT,
-            ADD COLUMN IF NOT EXISTS last_video_sent_at TIMESTAMPTZ
+            ADD COLUMN IF NOT EXISTS last_video_sent_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS expiry_notified    BOOLEAN DEFAULT FALSE
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS verifications (
@@ -510,6 +512,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 verify_token=None,
                 token_created=None,
                 videos_watched=0,
+                expiry_notified=False,
             )
             db_log_verification(user_id)
 
@@ -741,6 +744,41 @@ async def job_auto_delete_videos(app):
         logger.info(f"Auto-deleted {len(rows)} expired video(s).")
 
 
+async def job_notify_expired_access(app):
+    """Access expire ho chuke users ko ek baar notification bhejo."""
+    now = datetime.now(timezone.utc)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id FROM users "
+            "WHERE access_until IS NOT NULL "
+            "  AND access_until <= %s "
+            "  AND (expiry_notified IS NULL OR expiry_notified = FALSE)",
+            (now,),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for (uid,) in rows:
+        try:
+            await app.bot.send_message(
+                chat_id=uid,
+                text=(
+                    "⏰ *Access expire ho gaya!*\n\n"
+                    "Dobara videos dekhne ke liye /start karo aur link verify karo। 🔗"
+                ),
+                parse_mode="Markdown",
+            )
+        except TelegramError as e:
+            logger.warning(f"Expiry notify error uid={uid}: {e}")
+        db_update_user(uid, expiry_notified=True)
+
+    if rows:
+        logger.info(f"Notified {len(rows)} expired user(s).")
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -758,8 +796,9 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post_handler))
 
     scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(job_delete_broadcasts,   "interval", minutes=10, args=[app])
-    scheduler.add_job(job_auto_delete_videos,  "interval", minutes=2,  args=[app])
+    scheduler.add_job(job_delete_broadcasts,      "interval", minutes=10, args=[app])
+    scheduler.add_job(job_auto_delete_videos,     "interval", minutes=2,  args=[app])
+    scheduler.add_job(job_notify_expired_access,  "interval", minutes=5,  args=[app])
     scheduler.start()
 
     logger.info(f"@{BOT_USERNAME} starting...")
