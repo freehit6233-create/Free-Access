@@ -135,17 +135,21 @@ async def delete_after(chat_id, msg_id, delay):
     await asyncio.sleep(delay)
     await silent_delete(chat_id, msg_id)
 
-async def has_access(conn, user_id):
+async def has_access(conn, user_id, next_index=None):
+    """
+    Check if user can watch the next video.
+    next_index: the index they are TRYING to go to (0-based).
+                If None, uses their saved current_index.
+    """
     row = await get_user(conn, user_id)
     if row["is_banned"]:
         return False
+    # Active verified access
     if row["access_until"] and row["access_until"] > now_utc():
         return True
-    if row["free_start_ts"]:
-        elapsed = (now_utc() - row["free_start_ts"]).total_seconds()
-        if elapsed < FREE_RESET_HOURS * 3600 and row["current_index"] < FREE_VIDEOS:
-            return True
-    elif row["current_index"] < FREE_VIDEOS:
+    # Free window: first FREE_VIDEOS videos are free within 24h
+    idx = next_index if next_index is not None else row["current_index"]
+    if idx < FREE_VIDEOS:
         return True
     return False
 
@@ -347,7 +351,7 @@ async def cmd_start(message: types.Message):
                 row = await get_user(conn, user_id)
 
         idx    = row["current_index"]
-        access = await has_access(conn, user_id)
+        access = await has_access(conn, user_id, next_index=idx)
 
         if not access:
             await show_gate(user_id, conn)
@@ -390,18 +394,16 @@ async def cb_nav(callback: types.CallbackQuery):
                 new_idx = 0
                 row = await get_user(conn, user_id)
 
-        # Gate check — after free 3, require verification
-        access = await has_access(conn, user_id)
-        if not access and new_idx >= FREE_VIDEOS:
+        # Gate check — pass new_idx so we check the video they want to see
+        access = await has_access(conn, user_id, next_index=new_idx)
+        if not access:
             await callback.answer()
-            # Delete old nav message (video already sent above it)
             await silent_delete(user_id, row["last_nav_msg"])
             await show_gate(user_id, conn)
             return
 
-        # Save new index
+        # Access granted — save index and send video
         await conn.execute("UPDATE users SET current_index=$1 WHERE user_id=$2", new_idx, user_id)
-
         await callback.answer()
         await send_video(user_id, new_idx, video_ids, conn)
 
