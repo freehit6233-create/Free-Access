@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS users (
     last_verify_msg  BIGINT,
     last_video_msg   BIGINT,
     last_nav_msg     BIGINT,
-    is_banned        BOOLEAN     NOT NULL DEFAULT FALSE
+    is_banned        BOOLEAN     NOT NULL DEFAULT FALSE,
+    has_seen_all     BOOLEAN     NOT NULL DEFAULT FALSE
 );
 CREATE TABLE IF NOT EXISTS verifications (
     id          SERIAL PRIMARY KEY,
@@ -77,6 +78,7 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_index INT NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS videos_watched INT NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS has_seen_all BOOLEAN NOT NULL DEFAULT FALSE",
         ]:
             try:
                 await conn.execute(m)
@@ -187,20 +189,35 @@ async def delete_prev_video(user_id, conn):
     await silent_delete(user_id, row["last_video_msg"])
 
 async def send_video(user_id, index, video_ids, conn):
-    """Send video with nav buttons attached directly. Deletes previous video first."""
+    """Send video with nav buttons attached directly. Deletes previous video first.
+    If user has seen all videos (wrap-around), sends a random one instead."""
     if not video_ids:
         return
 
     # Delete previous video + nav
     await delete_prev_video(user_id, conn)
 
-    # Pick message_id (2% random inject)
-    if len(video_ids) > 1 and random.random() < RANDOM_INJECT_PCT:
-        msg_id = random.choice(video_ids)
-    else:
-        msg_id = video_ids[index % len(video_ids)]
+    row = await get_user(conn, user_id)
+    total = len(video_ids)
 
-    # Send video first (no reply_markup — copy_message doesn't support it reliably)
+    # Detect wrap-around: index >= total means user has looped through all videos
+    if index >= total:
+        await conn.execute("UPDATE users SET has_seen_all=TRUE WHERE user_id=$1", user_id)
+        row = await get_user(conn, user_id)
+
+    # If user has seen all → always send random video
+    if row["has_seen_all"]:
+        msg_id = random.choice(video_ids)
+        # Keep index clamped so nav still works sensibly
+        index = index % total
+    else:
+        # Normal flow: 2% random inject, else sequential
+        if total > 1 and random.random() < RANDOM_INJECT_PCT:
+            msg_id = random.choice(video_ids)
+        else:
+            msg_id = video_ids[index % total]
+
+    # Send video
     try:
         vid = await bot.copy_message(
             chat_id=user_id,
@@ -248,12 +265,45 @@ async def on_channel_post(message: types.Message):
     )
     if not is_video:
         return
+
+    new_msg_id = message.message_id
+
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO channel_videos(message_id) VALUES($1) ON CONFLICT DO NOTHING",
-            message.message_id,
+            new_msg_id,
         )
-    logger.info(f"Auto-indexed video: msg_id={message.message_id}")
+        # Find all users who have seen all videos (and are not banned)
+        rows = await conn.fetch(
+            "SELECT user_id FROM users WHERE has_seen_all=TRUE AND is_banned=FALSE"
+        )
+
+    logger.info(f"Auto-indexed video: msg_id={new_msg_id}, notifying {len(rows)} has_seen_all users")
+
+    # Silently push new video to those users
+    for row in rows:
+        uid = row["user_id"]
+        try:
+            async with pool.acquire() as conn:
+                # Check access before sending
+                access = await has_access(conn, uid)
+                if not access:
+                    continue
+                await bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=CHANNEL_ID,
+                    message_id=new_msg_id,
+                    protect_content=True,
+                )
+                # Reset has_seen_all — they've now received the new video
+                await conn.execute(
+                    "UPDATE users SET has_seen_all=FALSE WHERE user_id=$1", uid
+                )
+        except TelegramForbiddenError:
+            pass  # User blocked the bot
+        except Exception as e:
+            logger.warning(f"silent push uid={uid} mid={new_msg_id}: {e}")
+        await asyncio.sleep(0.05)
 
 
 # ── /index (admin) ────────────────────────────────────────────────────────────
@@ -462,7 +512,7 @@ async def cmd_reset(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE users SET access_until=NULL, free_start_ts=NULL, current_index=0, videos_watched=0")
+        await conn.execute("UPDATE users SET access_until=NULL, free_start_ts=NULL, current_index=0, videos_watched=0, has_seen_all=FALSE")
     sent = await message.answer("♻️ All users reset.")
     asyncio.create_task(delete_after(message.chat.id, sent.message_id, AUTO_DELETE_CMD))
     try: await message.delete()
