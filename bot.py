@@ -181,30 +181,27 @@ async def send_video(user_id, index, video_ids, conn):
     else:
         msg_id = video_ids[index % len(video_ids)]
 
-    # Send video
+    # Send video with nav buttons directly attached
     try:
         vid = await bot.copy_message(
             chat_id=user_id,
             from_chat_id=CHANNEL_ID,
             message_id=msg_id,
             protect_content=True,
+            reply_markup=nav_kb(index),
         )
     except TelegramBadRequest as e:
         logger.warning(f"copy_message uid={user_id} mid={msg_id}: {e}")
         return
 
-    # Send nav buttons as separate message (no counter text)
-    nav = await bot.send_message(user_id, "‌", reply_markup=nav_kb(index))  # zero-width non-joiner as placeholder
-
-    # Save message IDs for future deletion
+    # Save message ID for future deletion (nav is embedded in video msg)
     await conn.execute(
-        "UPDATE users SET last_video_msg=$1, last_nav_msg=$2 WHERE user_id=$3",
-        vid.message_id, nav.message_id, user_id,
+        "UPDATE users SET last_video_msg=$1, last_nav_msg=NULL WHERE user_id=$2",
+        vid.message_id, user_id,
     )
 
     # Schedule auto-delete after 10 min
     asyncio.create_task(delete_after(user_id, vid.message_id, AUTO_DELETE_VIDEO))
-    asyncio.create_task(delete_after(user_id, nav.message_id, AUTO_DELETE_VIDEO))
 
 
 # ── Channel post auto-indexer ─────────────────────────────────────────────────
