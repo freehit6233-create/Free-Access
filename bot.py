@@ -254,6 +254,72 @@ async def send_video(user_id, index, video_ids, conn):
         asyncio.create_task(delete_after(user_id, nav_id, AUTO_DELETE_VIDEO))
 
 
+async def push_latest_to_seen_all(new_msg_id: int):
+    """Send newly added video to all users who have seen the full playlist."""
+    video_ids = await get_video_ids()
+    if not video_ids:
+        return
+    new_index = len(video_ids) - 1
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id FROM users WHERE has_seen_all=TRUE AND is_banned=FALSE"
+        )
+
+    logger.info(f"push_latest mid={new_msg_id} → {len(rows)} has_seen_all users")
+
+    for row in rows:
+        uid = row["user_id"]
+        try:
+            async with pool.acquire() as conn:
+                access = await has_access(conn, uid)
+                if not access:
+                    continue
+
+                await delete_prev_video(uid, conn)
+
+                try:
+                    vid = await bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=CHANNEL_ID,
+                        message_id=new_msg_id,
+                        protect_content=True,
+                    )
+                except TelegramBadRequest as e:
+                    logger.warning(f"push_latest copy uid={uid}: {e}")
+                    continue
+
+                try:
+                    nav = await bot.send_message(
+                        chat_id=uid,
+                        text="👇",
+                        reply_markup=nav_kb(new_index),
+                    )
+                except Exception:
+                    nav = None
+
+                nav_id = nav.message_id if nav else None
+
+                await conn.execute(
+                    """UPDATE users
+                       SET last_video_msg=$1, last_nav_msg=$2,
+                           has_seen_all=FALSE, current_index=$3,
+                           videos_watched=videos_watched+1
+                       WHERE user_id=$4""",
+                    vid.message_id, nav_id, new_index, uid,
+                )
+
+                asyncio.create_task(delete_after(uid, vid.message_id, AUTO_DELETE_VIDEO))
+                if nav_id:
+                    asyncio.create_task(delete_after(uid, nav_id, AUTO_DELETE_VIDEO))
+
+        except TelegramForbiddenError:
+            pass
+        except Exception as e:
+            logger.warning(f"push_latest uid={uid}: {e}")
+        await asyncio.sleep(0.05)
+
+
 # ── Channel post auto-indexer ─────────────────────────────────────────────────
 @dp.channel_post()
 async def on_channel_post(message: types.Message):
@@ -273,74 +339,9 @@ async def on_channel_post(message: types.Message):
             "INSERT INTO channel_videos(message_id) VALUES($1) ON CONFLICT DO NOTHING",
             new_msg_id,
         )
-        # Find all users who have seen all videos (and are not banned)
-        rows = await conn.fetch(
-            "SELECT user_id FROM users WHERE has_seen_all=TRUE AND is_banned=FALSE"
-        )
 
-    logger.info(f"Auto-indexed video: msg_id={new_msg_id}, notifying {len(rows)} has_seen_all users")
-
-    # Get updated video list (includes the new video just indexed)
-    video_ids = await get_video_ids()
-    new_index  = len(video_ids) - 1  # latest video is at the end
-
-    # Push new video to has_seen_all users with nav + 10 min auto-delete
-    for row in rows:
-        uid = row["user_id"]
-        try:
-            async with pool.acquire() as conn:
-                # Access check — skip banned / expired unverified users
-                access = await has_access(conn, uid)
-                if not access:
-                    continue
-
-                # Delete their current random video first (clean UX)
-                await delete_prev_video(uid, conn)
-
-                # Send the new video
-                try:
-                    vid = await bot.copy_message(
-                        chat_id=uid,
-                        from_chat_id=CHANNEL_ID,
-                        message_id=new_msg_id,
-                        protect_content=True,
-                    )
-                except TelegramBadRequest as e:
-                    logger.warning(f"new-video push uid={uid}: {e}")
-                    continue
-
-                # Send nav buttons
-                try:
-                    nav = await bot.send_message(
-                        chat_id=uid,
-                        text="👇",
-                        reply_markup=nav_kb(new_index),
-                    )
-                except Exception:
-                    nav = None
-
-                nav_id = nav.message_id if nav else None
-
-                # Save IDs, reset has_seen_all, update index, bump watch count
-                await conn.execute(
-                    """UPDATE users
-                       SET last_video_msg=$1, last_nav_msg=$2,
-                           has_seen_all=FALSE, current_index=$3,
-                           videos_watched=videos_watched+1
-                       WHERE user_id=$4""",
-                    vid.message_id, nav_id, new_index, uid,
-                )
-
-                # Schedule 10 min auto-delete
-                asyncio.create_task(delete_after(uid, vid.message_id, AUTO_DELETE_VIDEO))
-                if nav_id:
-                    asyncio.create_task(delete_after(uid, nav_id, AUTO_DELETE_VIDEO))
-
-        except TelegramForbiddenError:
-            pass  # User blocked the bot
-        except Exception as e:
-            logger.warning(f"silent push uid={uid} mid={new_msg_id}: {e}")
-        await asyncio.sleep(0.05)
+    logger.info(f"Auto-indexed video: msg_id={new_msg_id}")
+    asyncio.create_task(push_latest_to_seen_all(new_msg_id))
 
 
 # ── /index (admin) ────────────────────────────────────────────────────────────
@@ -359,12 +360,14 @@ async def cmd_index(message: types.Message):
         except Exception: pass
         return
     added = 0
+    last_added_id = None
     async with pool.acquire() as conn:
         for p in parts:
             try:
                 await conn.execute(
                     "INSERT INTO channel_videos(message_id) VALUES($1) ON CONFLICT DO NOTHING", int(p)
                 )
+                last_added_id = int(p)
                 added += 1
             except Exception:
                 pass
@@ -373,6 +376,9 @@ async def cmd_index(message: types.Message):
     asyncio.create_task(delete_after(message.chat.id, sent.message_id, 20))
     try: await message.delete()
     except Exception: pass
+    # Push latest to has_seen_all users
+    if last_added_id:
+        asyncio.create_task(push_latest_to_seen_all(last_added_id))
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -476,7 +482,14 @@ async def cb_nav(callback: types.CallbackQuery):
             await callback.answer("No videos available.", show_alert=True)
             return
 
-        new_idx = (idx + 1) % len(video_ids) if direction == "next" else (idx - 1) % len(video_ids)
+        total   = len(video_ids)
+        raw_idx = (idx + 1) if direction == "next" else (idx - 1)
+        new_idx = raw_idx % total
+
+        # Detect wrap-around on Next: user has looped through all videos
+        if direction == "next" and raw_idx >= total:
+            await conn.execute("UPDATE users SET has_seen_all=TRUE WHERE user_id=$1", user_id)
+            row = await get_user(conn, user_id)
 
         # 24h reset
         if row["free_start_ts"]:
