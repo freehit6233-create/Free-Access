@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS channel_videos (
 CREATE TABLE IF NOT EXISTS users (
     user_id          BIGINT PRIMARY KEY,
     current_index    INT         NOT NULL DEFAULT 0,
+    videos_watched   INT         NOT NULL DEFAULT 0,
     free_start_ts    TIMESTAMPTZ,
     access_until     TIMESTAMPTZ,
     last_verify_msg  BIGINT,
@@ -74,6 +75,7 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_nav_msg BIGINT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_index INT NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS videos_watched INT NOT NULL DEFAULT 0",
         ]:
             try:
                 await conn.execute(m)
@@ -138,8 +140,8 @@ async def delete_after(chat_id, msg_id, delay):
 async def has_access(conn, user_id, next_index=None):
     """
     Check if user can watch the next video.
-    next_index: the index they are TRYING to go to (0-based).
-                If None, uses their saved current_index.
+    Gate triggers after FREE_VIDEOS total watches (not index-based).
+    next_index: kept for signature compatibility but watch count is the real gate.
     """
     row = await get_user(conn, user_id)
     if row["is_banned"]:
@@ -147,9 +149,8 @@ async def has_access(conn, user_id, next_index=None):
     # Active verified access
     if row["access_until"] and row["access_until"] > now_utc():
         return True
-    # Free window: first FREE_VIDEOS videos are free within 24h
-    idx = next_index if next_index is not None else row["current_index"]
-    if idx < FREE_VIDEOS:
+    # Free window: allow only first FREE_VIDEOS watches within 24h window
+    if row["videos_watched"] < FREE_VIDEOS:
         return True
     return False
 
@@ -211,9 +212,9 @@ async def send_video(user_id, index, video_ids, conn):
 
     nav_id = nav.message_id if nav else None
 
-    # Save both message IDs
+    # Save both message IDs and increment watch count
     await conn.execute(
-        "UPDATE users SET last_video_msg=$1, last_nav_msg=$2 WHERE user_id=$3",
+        "UPDATE users SET last_video_msg=$1, last_nav_msg=$2, videos_watched=videos_watched+1 WHERE user_id=$3",
         vid.message_id, nav_id, user_id,
     )
 
@@ -297,7 +298,7 @@ async def cmd_start(message: types.Message):
                 if uid_int == user_id and tok == make_token(user_id):
                     expiry = now_utc() + timedelta(hours=ACCESS_HOURS)
                     await conn.execute(
-                        "UPDATE users SET access_until=$1, last_verify_msg=NULL WHERE user_id=$2",
+                        "UPDATE users SET access_until=$1, last_verify_msg=NULL, videos_watched=0 WHERE user_id=$2",
                         expiry, user_id,
                     )
                     await conn.execute("INSERT INTO verifications(user_id) VALUES($1)", user_id)
@@ -345,7 +346,7 @@ async def cmd_start(message: types.Message):
             no_acc  = not row["access_until"] or row["access_until"] <= now_utc()
             if elapsed >= FREE_RESET_HOURS * 3600 and no_acc:
                 await conn.execute(
-                    "UPDATE users SET free_start_ts=$1, current_index=0 WHERE user_id=$2",
+                    "UPDATE users SET free_start_ts=$1, current_index=0, videos_watched=0 WHERE user_id=$2",
                     now_utc(), user_id,
                 )
                 row = await get_user(conn, user_id)
@@ -388,7 +389,7 @@ async def cb_nav(callback: types.CallbackQuery):
             no_acc  = not row["access_until"] or row["access_until"] <= now_utc()
             if elapsed >= FREE_RESET_HOURS * 3600 and no_acc:
                 await conn.execute(
-                    "UPDATE users SET free_start_ts=$1, current_index=0 WHERE user_id=$2",
+                    "UPDATE users SET free_start_ts=$1, current_index=0, videos_watched=0 WHERE user_id=$2",
                     now_utc(), user_id,
                 )
                 new_idx = 0
@@ -448,7 +449,7 @@ async def cmd_reset(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE users SET access_until=NULL, free_start_ts=NULL, current_index=0")
+        await conn.execute("UPDATE users SET access_until=NULL, free_start_ts=NULL, current_index=0, videos_watched=0")
     sent = await message.answer("♻️ All users reset.")
     asyncio.create_task(delete_after(message.chat.id, sent.message_id, AUTO_DELETE_CMD))
     try: await message.delete()
