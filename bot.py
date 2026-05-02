@@ -280,15 +280,11 @@ async def on_channel_post(message: types.Message):
 
     logger.info(f"Auto-indexed video: msg_id={new_msg_id}, notifying {len(rows)} has_seen_all users")
 
-    # Silently push new video to those users
+    # Silently push new video — no nav buttons, no auto-delete, just like channel post
     for row in rows:
         uid = row["user_id"]
         try:
             async with pool.acquire() as conn:
-                # Check access before sending
-                access = await has_access(conn, uid)
-                if not access:
-                    continue
                 await bot.copy_message(
                     chat_id=uid,
                     from_chat_id=CHANNEL_ID,
