@@ -162,10 +162,11 @@ async def show_gate(user_id, conn):
     await conn.execute("UPDATE users SET last_verify_msg=$1 WHERE user_id=$2", sent.message_id, user_id)
 
 async def delete_prev_video(user_id, conn):
-    """Delete user's previously sent video + nav message."""
+    """Delete user's previously sent nav + video message."""
     row = await get_user(conn, user_id)
-    await silent_delete(user_id, row["last_video_msg"])
+    # Delete nav first, then video (cleaner UX)
     await silent_delete(user_id, row["last_nav_msg"])
+    await silent_delete(user_id, row["last_video_msg"])
 
 async def send_video(user_id, index, video_ids, conn):
     """Send video with nav buttons attached directly. Deletes previous video first."""
@@ -181,27 +182,41 @@ async def send_video(user_id, index, video_ids, conn):
     else:
         msg_id = video_ids[index % len(video_ids)]
 
-    # Send video with nav buttons directly attached
+    # Send video first (no reply_markup — copy_message doesn't support it reliably)
     try:
         vid = await bot.copy_message(
             chat_id=user_id,
             from_chat_id=CHANNEL_ID,
             message_id=msg_id,
             protect_content=True,
-            reply_markup=nav_kb(index),
         )
     except TelegramBadRequest as e:
         logger.warning(f"copy_message uid={user_id} mid={msg_id}: {e}")
         return
 
-    # Save message ID for future deletion (nav is embedded in video msg)
+    # Send nav buttons as a separate message right after video
+    try:
+        nav = await bot.send_message(
+            chat_id=user_id,
+            text="👇",
+            reply_markup=nav_kb(index),
+        )
+    except Exception as e:
+        logger.warning(f"nav send failed uid={user_id}: {e}")
+        nav = None
+
+    nav_id = nav.message_id if nav else None
+
+    # Save both message IDs
     await conn.execute(
-        "UPDATE users SET last_video_msg=$1, last_nav_msg=NULL WHERE user_id=$2",
-        vid.message_id, user_id,
+        "UPDATE users SET last_video_msg=$1, last_nav_msg=$2 WHERE user_id=$3",
+        vid.message_id, nav_id, user_id,
     )
 
     # Schedule auto-delete after 10 min
     asyncio.create_task(delete_after(user_id, vid.message_id, AUTO_DELETE_VIDEO))
+    if nav_id:
+        asyncio.create_task(delete_after(user_id, nav_id, AUTO_DELETE_VIDEO))
 
 
 # ── Channel post auto-indexer ─────────────────────────────────────────────────
