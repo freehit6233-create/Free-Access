@@ -7,6 +7,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
+import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -105,13 +106,24 @@ def make_token(user_id):
     # Use HMAC-style: hash of "uid:secret" — no underscores in hex output so split is safe
     return hashlib.sha256(f"{user_id}:{VP_TOKEN}".encode()).hexdigest()[:32]
 
-def make_verify_url(user_id):
+async def make_verify_url(user_id):
     token   = make_token(user_id)
-    # payload format: verify-USERID-TOKEN  (dash separator, not underscore)
     payload = f"verify-{user_id}-{token}"
     dest    = f"https://t.me/{BOT_USERNAME}?start={payload}"
     encoded = urllib.parse.quote(dest, safe="")
-    return f"https://vplink.in/api?api={VP_TOKEN}&url={encoded}&alias=v{user_id}"
+    api_url = f"https://vplink.in/api?api={VP_TOKEN}&url={encoded}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                data = await resp.json(content_type=None)
+                if data.get("status") == "success":
+                    return data["shortenedUrl"]
+                else:
+                    logger.warning(f"VPLink API error for uid={user_id}: {data}")
+    except Exception as e:
+        logger.warning(f"VPLink request failed uid={user_id}: {e}")
+    # Fallback: direct bot link (no monetization but user can still verify)
+    return dest
 
 def nav_kb(index):
     b = InlineKeyboardBuilder()
@@ -120,9 +132,9 @@ def nav_kb(index):
     b.adjust(2)
     return b.as_markup()
 
-def verify_kb(user_id):
+def verify_kb(url):
     b = InlineKeyboardBuilder()
-    b.button(text="🔗 Get Link", url=make_verify_url(user_id))
+    b.button(text="🔗 Get Link", url=url)
     return b.as_markup()
 
 async def silent_delete(chat_id, msg_id):
@@ -158,11 +170,12 @@ async def show_gate(user_id, conn):
     """Delete old gate message (anti-spam) and send fresh verification gate."""
     row = await get_user(conn, user_id)
     await silent_delete(user_id, row["last_verify_msg"])
+    vp_url = await make_verify_url(user_id)
     sent = await bot.send_message(
         user_id,
         "🔒 *Access Required*\n\nVerify this link to get *3 hours free access*:",
         parse_mode="Markdown",
-        reply_markup=verify_kb(user_id),
+        reply_markup=verify_kb(vp_url),
     )
     await conn.execute("UPDATE users SET last_verify_msg=$1 WHERE user_id=$2", sent.message_id, user_id)
 
