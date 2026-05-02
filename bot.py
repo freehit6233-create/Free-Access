@@ -63,7 +63,7 @@ pool = None
 
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, ssl="require", min_size=1, max_size=5)
+    pool = await asyncpg.create_pool(DATABASE_URL, ssl="require", min_size=1, max_size=5, statement_cache_size=0)
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA)
         for m in [
