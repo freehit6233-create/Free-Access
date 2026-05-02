@@ -280,21 +280,62 @@ async def on_channel_post(message: types.Message):
 
     logger.info(f"Auto-indexed video: msg_id={new_msg_id}, notifying {len(rows)} has_seen_all users")
 
-    # Silently push new video — no nav buttons, no auto-delete, just like channel post
+    # Get updated video list (includes the new video just indexed)
+    video_ids = await get_video_ids()
+    new_index  = len(video_ids) - 1  # latest video is at the end
+
+    # Push new video to has_seen_all users with nav + 10 min auto-delete
     for row in rows:
         uid = row["user_id"]
         try:
             async with pool.acquire() as conn:
-                await bot.copy_message(
-                    chat_id=uid,
-                    from_chat_id=CHANNEL_ID,
-                    message_id=new_msg_id,
-                    protect_content=True,
-                )
-                # Reset has_seen_all — they've now received the new video
+                # Access check — skip banned / expired unverified users
+                access = await has_access(conn, uid)
+                if not access:
+                    continue
+
+                # Delete their current random video first (clean UX)
+                await delete_prev_video(uid, conn)
+
+                # Send the new video
+                try:
+                    vid = await bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=CHANNEL_ID,
+                        message_id=new_msg_id,
+                        protect_content=True,
+                    )
+                except TelegramBadRequest as e:
+                    logger.warning(f"new-video push uid={uid}: {e}")
+                    continue
+
+                # Send nav buttons
+                try:
+                    nav = await bot.send_message(
+                        chat_id=uid,
+                        text="👇",
+                        reply_markup=nav_kb(new_index),
+                    )
+                except Exception:
+                    nav = None
+
+                nav_id = nav.message_id if nav else None
+
+                # Save IDs, reset has_seen_all, update index, bump watch count
                 await conn.execute(
-                    "UPDATE users SET has_seen_all=FALSE WHERE user_id=$1", uid
+                    """UPDATE users
+                       SET last_video_msg=$1, last_nav_msg=$2,
+                           has_seen_all=FALSE, current_index=$3,
+                           videos_watched=videos_watched+1
+                       WHERE user_id=$4""",
+                    vid.message_id, nav_id, new_index, uid,
                 )
+
+                # Schedule 10 min auto-delete
+                asyncio.create_task(delete_after(uid, vid.message_id, AUTO_DELETE_VIDEO))
+                if nav_id:
+                    asyncio.create_task(delete_after(uid, nav_id, AUTO_DELETE_VIDEO))
+
         except TelegramForbiddenError:
             pass  # User blocked the bot
         except Exception as e:
