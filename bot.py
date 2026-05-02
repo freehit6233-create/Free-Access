@@ -456,14 +456,9 @@ async def cmd_start(message: types.Message):
 
         if not access:
             await show_gate(user_id, conn)
-            try: await message.delete()
-            except Exception: pass
             return
 
         await send_video(user_id, idx, video_ids, conn)
-
-    try: await message.delete()
-    except Exception: pass
 
 
 # ── Navigation callbacks ──────────────────────────────────────────────────────
@@ -518,8 +513,6 @@ async def cmd_help(message: types.Message):
         parse_mode="Markdown",
     )
     asyncio.create_task(delete_after(message.chat.id, sent.message_id, 30))
-    try: await message.delete()
-    except Exception: pass
 
 
 # ── /status (admin) ───────────────────────────────────────────────────────────
