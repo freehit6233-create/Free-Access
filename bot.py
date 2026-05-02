@@ -64,6 +64,19 @@ async def init_db():
     pool = await asyncpg.create_pool(DATABASE_URL, ssl="require", min_size=1, max_size=5)
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA)
+        # Migrate existing tables that may be missing columns
+        migrations = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_start_ts TIMESTAMPTZ",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS access_until TIMESTAMPTZ",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_verify_msg BIGINT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_index INT NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE",
+        ]
+        for m in migrations:
+            try:
+                await conn.execute(m)
+            except Exception:
+                pass
     logger.info("DB pool ready")
 
 async def get_user(conn, user_id):
