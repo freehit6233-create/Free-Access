@@ -24,12 +24,13 @@ VP_TOKEN     = os.environ["VP_LINK_TOKEN"]
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "RNDAccess_bot").lstrip("@")
 
 FREE_VIDEOS       = 3
-ACCESS_HOURS      = 3
+ACCESS_HOURS      = 12
 FREE_RESET_HOURS  = 24
 AUTO_DELETE_VIDEO = 600   # 10 min
 AUTO_DELETE_CMD   = 10
 BROADCAST_TTL     = 43200
 RANDOM_INJECT_PCT = 0.02
+REPEAT_CHANCE     = 0.02   # 2% chance to repeat a seen video when unseen exist
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS channel_videos (
@@ -53,6 +54,12 @@ CREATE TABLE IF NOT EXISTS verifications (
     id          SERIAL PRIMARY KEY,
     user_id     BIGINT NOT NULL,
     verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS user_history (
+    user_id    BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, message_id)
 );
 CREATE TABLE IF NOT EXISTS broadcast_msgs (
     id          SERIAL PRIMARY KEY,
@@ -97,6 +104,46 @@ async def get_video_ids():
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT message_id FROM channel_videos ORDER BY id ASC")
     return [r["message_id"] for r in rows]
+
+async def mark_seen(conn, user_id, msg_id):
+    """Record that user has watched this video."""
+    await conn.execute(
+        "INSERT INTO user_history(user_id, message_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        user_id, msg_id,
+    )
+
+async def get_seen_ids(conn, user_id):
+    """Return set of message_ids user has already seen."""
+    rows = await conn.fetch("SELECT message_id FROM user_history WHERE user_id=$1", user_id)
+    return {r["message_id"] for r in rows}
+
+async def pick_video(conn, user_id, video_ids):
+    """
+    Pick next video for user based on history:
+      Case 1 — unseen exist:  98% unseen random, 2% seen random repeat
+      Case 2 — all seen:      100% seen random repeat
+      Case 3 — new DB media:  auto appears in unseen → 98% chance it gets picked
+    Returns (msg_id, all_seen: bool)
+    """
+    if not video_ids:
+        return None, False
+    seen    = await get_seen_ids(conn, user_id)
+    unseen  = [v for v in video_ids if v not in seen]
+    all_ids = video_ids
+
+    if unseen:
+        # Case 1 / Case 3
+        if random.random() < REPEAT_CHANCE and seen:
+            msg_id = random.choice([v for v in all_ids if v in seen])
+        else:
+            msg_id = random.choice(unseen)
+        all_seen = False
+    else:
+        # Case 2 — all seen
+        msg_id   = random.choice(all_ids)
+        all_seen = True
+
+    return msg_id, all_seen
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -175,7 +222,7 @@ async def show_gate(user_id, conn):
     vp_url = await make_verify_url(user_id)
     sent = await bot.send_message(
         user_id,
-        "🔒 *Access Required*\n\nVerify this link to get *3 hours free access*:",
+        "🔒 *Access Required*\n\nVerify this link to get *12 hours free access*:",
         parse_mode="Markdown",
         reply_markup=verify_kb(vp_url),
     )
@@ -189,35 +236,24 @@ async def delete_prev_video(user_id, conn):
     await silent_delete(user_id, row["last_video_msg"])
 
 async def send_video(user_id, index, video_ids, conn):
-    """Send video with nav buttons attached directly. Deletes previous video first.
-    If user has seen all videos (wrap-around), sends a random one instead."""
+    """Send video using history-based pick logic. Deletes previous video first."""
     if not video_ids:
         return
 
-    # Delete previous video + nav
     await delete_prev_video(user_id, conn)
 
-    row = await get_user(conn, user_id)
-    total = len(video_ids)
+    msg_id, all_seen = await pick_video(conn, user_id, video_ids)
+    if msg_id is None:
+        return
 
-    # Detect wrap-around: index >= total means user has looped through all videos
-    if index >= total:
-        await conn.execute("UPDATE users SET has_seen_all=TRUE WHERE user_id=$1", user_id)
-        row = await get_user(conn, user_id)
+    # Update has_seen_all flag
+    await conn.execute(
+        "UPDATE users SET has_seen_all=$1 WHERE user_id=$2", all_seen, user_id
+    )
 
-    # If user has seen all → always send random video
-    if row["has_seen_all"]:
-        msg_id = random.choice(video_ids)
-        # Keep index clamped so nav still works sensibly
-        index = index % total
-    else:
-        # Normal flow: 2% random inject, else sequential
-        if total > 1 and random.random() < RANDOM_INJECT_PCT:
-            msg_id = random.choice(video_ids)
-        else:
-            msg_id = video_ids[index % total]
+    # Clamp index for nav buttons
+    safe_index = index % len(video_ids)
 
-    # Send video
     try:
         vid = await bot.copy_message(
             chat_id=user_id,
@@ -229,12 +265,11 @@ async def send_video(user_id, index, video_ids, conn):
         logger.warning(f"copy_message uid={user_id} mid={msg_id}: {e}")
         return
 
-    # Send nav buttons as a separate message right after video
     try:
         nav = await bot.send_message(
             chat_id=user_id,
             text="👇",
-            reply_markup=nav_kb(index),
+            reply_markup=nav_kb(safe_index),
         )
     except Exception as e:
         logger.warning(f"nav send failed uid={user_id}: {e}")
@@ -242,13 +277,13 @@ async def send_video(user_id, index, video_ids, conn):
 
     nav_id = nav.message_id if nav else None
 
-    # Save both message IDs and increment watch count
+    # Mark as seen + save IDs + bump watch count
+    await mark_seen(conn, user_id, msg_id)
     await conn.execute(
         "UPDATE users SET last_video_msg=$1, last_nav_msg=$2, videos_watched=videos_watched+1 WHERE user_id=$3",
         vid.message_id, nav_id, user_id,
     )
 
-    # Schedule auto-delete after 10 min
     asyncio.create_task(delete_after(user_id, vid.message_id, AUTO_DELETE_VIDEO))
     if nav_id:
         asyncio.create_task(delete_after(user_id, nav_id, AUTO_DELETE_VIDEO))
@@ -263,19 +298,23 @@ async def push_latest_to_seen_all(new_msg_id: int):
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT user_id FROM users WHERE has_seen_all=TRUE AND is_banned=FALSE"
+            """SELECT u.user_id FROM users u
+               WHERE u.has_seen_all = TRUE
+                 AND u.is_banned    = FALSE
+                 AND NOT EXISTS (
+                     SELECT 1 FROM user_history h
+                     WHERE h.user_id = u.user_id AND h.message_id = $1
+                 )""",
+            new_msg_id,
         )
 
-    logger.info(f"push_latest mid={new_msg_id} → {len(rows)} has_seen_all users")
+    logger.info(f"push_latest mid={new_msg_id} → {len(rows)} eligible users")
 
     for row in rows:
         uid = row["user_id"]
         try:
             async with pool.acquire() as conn:
-                access = await has_access(conn, uid)
-                if not access:
-                    continue
-
+                # No access gate — push regardless of verification status
                 await delete_prev_video(uid, conn)
 
                 try:
@@ -300,6 +339,8 @@ async def push_latest_to_seen_all(new_msg_id: int):
 
                 nav_id = nav.message_id if nav else None
 
+                # Mark seen + reset has_seen_all (new content = not all seen anymore)
+                await mark_seen(conn, uid, new_msg_id)
                 await conn.execute(
                     """UPDATE users
                        SET last_video_msg=$1, last_nav_msg=$2,
@@ -486,11 +527,6 @@ async def cb_nav(callback: types.CallbackQuery):
         raw_idx = (idx + 1) if direction == "next" else (idx - 1)
         new_idx = raw_idx % total
 
-        # Detect wrap-around on Next: user has looped through all videos
-        if direction == "next" and raw_idx >= total:
-            await conn.execute("UPDATE users SET has_seen_all=TRUE WHERE user_id=$1", user_id)
-            row = await get_user(conn, user_id)
-
         # 24h reset
         if row["free_start_ts"]:
             elapsed = (now_utc() - row["free_start_ts"]).total_seconds()
@@ -522,7 +558,7 @@ async def cb_nav(callback: types.CallbackQuery):
 async def cmd_help(message: types.Message):
     sent = await message.answer(
         "📖 *Help*\n\n/start — Watch videos\n/help — This message\n\n"
-        "_3 videos free per 24h. Verify link for 3h full access._",
+        "_3 videos free per 24h. Verify link for 12h full access._",
         parse_mode="Markdown",
     )
     asyncio.create_task(delete_after(message.chat.id, sent.message_id, 30))
